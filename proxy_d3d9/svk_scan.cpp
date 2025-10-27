@@ -177,7 +177,7 @@ extern "C" void __declspec(naked) hkLoader()
 
         popad
         popfd
-        jmp dword ptr[g_OriLoader]  // tail-jump into MinHook trampoline
+        jmp dword ptr [g_OriLoader]  // tail-jump into MinHook trampoline
     }
 }
 

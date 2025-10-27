@@ -11,6 +11,7 @@
 #include <cstring>
 #include <intrin.h>
 #include "net_trace.h"
+#include "latency.h"
 
 
 #include "task_queue.h"   // RunScheduled()

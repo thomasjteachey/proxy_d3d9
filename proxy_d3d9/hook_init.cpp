@@ -7,6 +7,9 @@
 #include "hooks.h"   // InstallEndSceneHook, InstallCombatHooks
 #include "svk_scan.h"
 #include "net_trace.h"
+#include "latency.h"
+#include "net_split.h"
+#include "call_split.h"
 
 static std::once_flag gOnce;
 static std::atomic<bool> gEndSceneHooked{ false };
@@ -45,7 +48,10 @@ void InitHooksOnce()
 {
     std::call_once(gOnce, [] {
         MH_Initialize();
+        Latency_Init();   // <-- add this line
+        CallSplit_Init();   // <-- add this
         NetTrace::Init();
+        NetSplit_Init();
         // Pattern-scan & attach combat hooks (safe if patterns not set—they’ll just no-op).
         InstallCombatHooks();
         OutputDebugStringA("[ClientFix] InitHooksOnce()\n");

@@ -63,6 +63,15 @@
     <ClInclude Include="net_trace.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="latency.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="net_split.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="call_split.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\3rdparty\minhook\src\buffer.c">
@@ -107,10 +116,13 @@
     <ClCompile Include="net_recv_hooks.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="proc_hit.cpp">
+    <ClCompile Include="latency.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="proc_hook.cpp">
+    <ClCompile Include="net_split.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="call_split.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
