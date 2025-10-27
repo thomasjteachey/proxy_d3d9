@@ -1,8 +1,7 @@
-﻿// call_split.cpp — generalized call-splitter (x86) with auto-scan + per-actor gating.
-// - Finds ALL callsites that jump to the same target(s) as your seed return-addresses.
-// - Patches them with tiny stubs (no inline asm).
-// - First call for an actor processes now; the immediate next (≤kWindowMs) sleeps kDelayMs.
-// Build: Win32 (x86). Link winmm.lib for timeBeginPeriod.
+﻿// call_split.cpp — generalized call-splitter with frame-fence + per-actor gating.
+// - Auto-scans .text for every CALL E8 that targets the same handler(s) as your seeds.
+// - If two calls for the same actor occur in the same frame, the 2nd waits for next frame.
+// - No inline asm; x86 only.
 
 #if !defined(_M_IX86)
 #error Build this file for Win32 (x86)
@@ -18,26 +17,29 @@
 #include <windows.h>
 #include <vector>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <algorithm>
-#include <mmsystem.h>
-#pragma comment(lib, "winmm.lib")
 
-// --------- tuning knobs ----------
-static volatile LONG g_enabled = 1;   // F10 toggles
-static const DWORD   kWindowMs = 3;  // treat calls within 3ms as "same frame"
-static const DWORD   kDelayMs = 1;  // delay second call by 1ms
-static const size_t  kMaxSites = 256;
-// ---------------------------------
+#include "frame_fence.h"
+
+// -------- knobs --------
+static volatile LONG g_enabled = 1;    // F10 toggles ON/OFF. Starts ON.
+static const size_t  kMaxSites = 256; // max callsites to patch
+// -----------------------
 
 static void dlog(const char* s) { OutputDebugStringA(s); }
 static void dprintfA(const char* fmt, ...) {
     char b[512]; va_list ap; va_start(ap, fmt);
-    _vsnprintf_s(b, _TRUNCATE, fmt, ap); va_end(ap);
-    OutputDebugStringA(b);
+#if _MSC_VER >= 1400
+    _vsnprintf_s(b, _TRUNCATE, fmt, ap);
+#else
+    _vsnprintf(b, sizeof(b) - 1, fmt, ap); b[sizeof(b) - 1] = 0;
+#endif
+    va_end(ap); OutputDebugStringA(b);
 }
 
-// Your two seed return-addresses (from NET logs “TOP CALLERS”)
+// Your seed RETURN addresses (from your TOP CALLERS logs)
 static const uintptr_t kSeedRetAddrs[] = {
     0x00467E64,   // dominant
     0x00466F38    // rarer
@@ -48,14 +50,14 @@ struct Site {
     BYTE* call;       // address of CALL E8 .. (ret-5)
     BYTE      orig[5];    // saved bytes
     void* stub;       // our stub (executable)
-    uintptr_t target;     // resolved callee address
+    uintptr_t target;     // resolved callee
     bool      armed;
 };
 
-static std::vector<Site> g_sites;
-static std::vector<uintptr_t> g_targets; // unique callee addresses (resolved from seeds)
+static std::vector<Site>       g_sites;
+static std::vector<uintptr_t>  g_targets; // unique handler targets
 
-// --- simple PE helpers to scan .text for CALLs ---
+// --- PE helpers to find .text ---
 static bool GetTextRange(BYTE*& base, BYTE*& text, DWORD& textSize)
 {
     base = (BYTE*)GetModuleHandleA(nullptr);
@@ -98,51 +100,45 @@ static bool ProtWrite(void* p, const void* src, SIZE_T n) {
     return true;
 }
 
-// ---- per-actor timing (ECX == this) ----
-// Tiny fixed-size hash map keyed by 'this' pointer.
-struct ActorTick {
+// ---- per-actor last-frame (ECX == this) ----
+struct ActorFrame {
     void* key;
-    DWORD last;
+    unsigned lastFrame;
 };
-static ActorTick g_actorTicks[256] = {}; // linear-probe ring
+static ActorFrame g_actorFrames[256] = {};
 
-static DWORD* TouchActor(void* key)
+static unsigned* TouchActor(void* key)
 {
     if (!key) return nullptr;
     size_t idx = (reinterpret_cast<uintptr_t>(key) >> 4) & (256 - 1);
     for (size_t i = 0; i < 256; ++i) {
         size_t p = (idx + i) & (256 - 1);
-        if (g_actorTicks[p].key == key || g_actorTicks[p].key == nullptr) {
-            g_actorTicks[p].key = key;
-            return &g_actorTicks[p].last;
+        if (g_actorFrames[p].key == key || g_actorFrames[p].key == nullptr) {
+            g_actorFrames[p].key = key;
+            return &g_actorFrames[p].lastFrame;
         }
     }
-    // fallback: overwrite slot 0
-    g_actorTicks[0].key = key;
-    return &g_actorTicks[0].last;
+    g_actorFrames[0].key = key;
+    return &g_actorFrames[0].lastFrame;
 }
 
-// ----- splitter decision called from stubs -----
+// ----- decision function called from stubs -----
 extern "C" __declspec(noinline) void __cdecl CallSplit_OnEnter(void* ecxThis, uintptr_t callsite)
 {
-    (void)callsite; // reserved for future per-callsite rules
+    (void)callsite;
     if (InterlockedCompareExchange(&g_enabled, 0, 0) == 0) return;
 
-    DWORD now = timeGetTime();
+    const unsigned curFrame = FrameFence_Id();
+    unsigned* lastPtr = TouchActor(ecxThis);
 
-    // Prefer per-actor gating if ECX looks valid; otherwise per-thread "last"
-    DWORD* last = TouchActor(ecxThis);
-    static DWORD g_lastFallback = 0;
-
-    DWORD prev = last ? *last : g_lastFallback;
-    DWORD dt = now - prev;
-    if (dt <= kWindowMs) {
-        Sleep(kDelayMs);   // nudge the 2nd event to the next tick
-        now = timeGetTime();
+    unsigned last = lastPtr ? *lastPtr : 0;
+    if (last == curFrame) {
+        // same frame for this actor — wait for next rendered frame
+        FrameFence_WaitNext(12); // safety timeout in case of pause/loading
     }
 
-    if (last) *last = now;
-    else      g_lastFallback = now;
+    const unsigned after = FrameFence_Id();
+    if (lastPtr) *lastPtr = after;
 }
 
 // Build stub:
@@ -152,7 +148,7 @@ static void* BuildStub(uintptr_t target, uintptr_t callsite)
     BYTE code[] = {
         0x9C,                         // pushfd
         0x60,                         // pushad
-        0x51,                         // push ecx (this)
+        0x51,                         // push ecx
         0x68, 0,0,0,0,                // push imm32 (callsite)
         0xB8, 0,0,0,0,                // mov eax, &CallSplit_OnEnter
         0xFF, 0xD0,                   // call eax
@@ -212,14 +208,11 @@ static void ScanAndPatchAll()
         int32_t rel = *reinterpret_cast<int32_t*>(p + 1);
         uintptr_t tgt = (uintptr_t)(p + 5) + rel;
 
-        // is this call to a known target?
         if (std::find(g_targets.begin(), g_targets.end(), tgt) == g_targets.end())
             continue;
 
-        // avoid duplicates
-        BYTE* call = p;
         if (std::any_of(g_sites.begin(), g_sites.end(),
-            [call](const Site& s) { return s.call == call; }))
+            [p](const Site& s) { return s.call == p; }))
             continue;
 
         Site s{};
@@ -233,13 +226,11 @@ static void ScanAndPatchAll()
         ++added;
     }
 
-    dprintfA("[CALLSPLIT] scan found/added=%u (total=%u)\n", (unsigned)added, (unsigned)g_sites.size());
-
-    // Arm everything
+    dprintfA("[CALLSPLIT] scan added=%u (total=%u)\n", (unsigned)added, (unsigned)g_sites.size());
     for (auto& s : g_sites) ArmSite(s);
 }
 
-// ---- hotkey thread: F10 toggle ----
+// ---- hotkey thread: F10 toggles ----
 static DWORD WINAPI KeyThread(LPVOID)
 {
     dlog("[CALLSPLIT] F10 toggles ON/OFF\n");
@@ -258,9 +249,9 @@ void CallSplit_Init()
 {
     static bool once = false; if (once) return; once = true;
 
-    timeBeginPeriod(1);
+    FrameFence_Init();   // make sure timer granularity is good
 
-    // 1) Resolve seed targets from your two return addresses
+    // 1) resolve seed targets from your two ret-addrs
     for (uintptr_t ret : kSeedRetAddrs) {
         BYTE* call = nullptr; uintptr_t tgt = 0;
         if (ResolveCallFromRet(ret, call, tgt)) {
@@ -271,18 +262,17 @@ void CallSplit_Init()
             }
         }
         else {
-            dprintfA("[CALLSPLIT] seed ret=0x%08X not a CALL — skipped\n", (unsigned)ret);
+            dprintfA("[CALLSPLIT] seed ret=0x%08X not CALL — skipped\n", (unsigned)ret);
         }
     }
 
-    // 2) Scan .text and arm all callsites to those targets
+    // 2) patch all callsites to those targets
     ScanAndPatchAll();
 
-    // 3) Hotkey thread
+    // 3) hotkey
     HANDLE th = CreateThread(nullptr, 0, KeyThread, nullptr, 0, nullptr);
     if (th) CloseHandle(th);
 
-    dprintfA("[CALLSPLIT] ready (targets=%u, sites=%u, window=%ums, delay=%ums)\n",
-        (unsigned)g_targets.size(), (unsigned)g_sites.size(),
-        (unsigned)kWindowMs, (unsigned)kDelayMs);
+    dprintfA("[CALLSPLIT] ready (targets=%u, sites=%u)\n",
+        (unsigned)g_targets.size(), (unsigned)g_sites.size());
 }

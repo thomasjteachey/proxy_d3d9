@@ -168,6 +168,7 @@
     <ClInclude Include="aob_scan.h" />
     <ClInclude Include="call_split.h" />
     <ClInclude Include="framework.h" />
+    <ClInclude Include="frame_fence.h" />
     <ClInclude Include="hooks.h" />
     <ClInclude Include="hook_init.h" />
     <ClInclude Include="latency.h" />
@@ -186,6 +187,7 @@
     <ClCompile Include="aob_scan.cpp" />
     <ClCompile Include="call_split.cpp" />
     <ClCompile Include="d3d9_proxy.cpp" />
+    <ClCompile Include="frame_fence.cpp" />
     <ClCompile Include="hooks.cpp" />
     <ClCompile Include="hook_init.cpp" />
     <ClCompile Include="latency.cpp" />

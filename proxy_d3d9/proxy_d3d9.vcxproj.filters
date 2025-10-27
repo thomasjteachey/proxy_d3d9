@@ -72,6 +72,9 @@
     <ClInclude Include="call_split.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="frame_fence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\3rdparty\minhook\src\buffer.c">
@@ -123,6 +126,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="call_split.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="frame_fence.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
