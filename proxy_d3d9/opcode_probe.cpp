@@ -54,19 +54,16 @@ HMODULE g_wowModule = nullptr;
 std::uintptr_t g_wowBase = 0;
 std::size_t g_wowSize = 0;
 using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
-Send_t g_origSend = nullptr;
-
-using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
-Send_t g_origSend = nullptr;
+Send_t g_origWinsockSend = nullptr;
 
 using WSASend_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
-WSASend_t g_origWSASend = nullptr;
+WSASend_t g_origWinsockWSASend = nullptr;
 
 using Recv_t = int (WSAAPI*)(SOCKET, char*, int, int);
-Recv_t g_origRecv = nullptr;
+Recv_t g_origWinsockRecv = nullptr;
 
 using WSARecv_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
-WSARecv_t g_origWSARecv = nullptr;
+WSARecv_t g_origWinsockWSARecv = nullptr;
 
 struct ProbeConfig {
     std::string phase;
@@ -429,7 +426,7 @@ int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
         }
     }
 
-    return g_origSend ? g_origSend(s, buffer, length, flags) : SOCKET_ERROR;
+    return g_origWinsockSend ? g_origWinsockSend(s, buffer, length, flags) : SOCKET_ERROR;
 }
 
 int WSAAPI hkWSASend(
@@ -459,7 +456,7 @@ int WSAAPI hkWSASend(
         }
     }
 
-    return g_origWSASend ? g_origWSASend(s, buffers, bufferCount, bytesSent, flags, overlapped, completion) : SOCKET_ERROR;
+    return g_origWinsockWSASend ? g_origWinsockWSASend(s, buffers, bufferCount, bytesSent, flags, overlapped, completion) : SOCKET_ERROR;
 }
 
 int WSAAPI hkRecv(SOCKET s, char* buffer, int length, int flags) {
@@ -467,7 +464,7 @@ int WSAAPI hkRecv(SOCKET s, char* buffer, int length, int flags) {
         LogDiscoverStack("recv");
     }
 
-    int result = g_origRecv ? g_origRecv(s, buffer, length, flags) : SOCKET_ERROR;
+    int result = g_origWinsockRecv ? g_origWinsockRecv(s, buffer, length, flags) : SOCKET_ERROR;
 
     if (g_mode == ProbeMode::Winsock && result > 0 && buffer) {
         PacketHeader header;
@@ -488,7 +485,7 @@ int WSAAPI hkWSARecv(
         LogDiscoverStack("WSARecv");
     }
 
-    int result = g_origWSARecv ? g_origWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
+    int result = g_origWinsockWSARecv ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
 
     if (g_mode == ProbeMode::Winsock && result == 0 && buffers && bufferCount > 0 && bytesRecvd && *bytesRecvd >= 4 && !overlapped) {
         PacketHeader header;
@@ -537,16 +534,16 @@ bool InstallHook(const char* moduleName, const char* procName, void* detour, voi
 
 bool InstallWinsockHooks() {
     bool anyHooked = false;
-    if (InstallHook("Ws2_32.dll", "send", reinterpret_cast<void*>(hkSend), reinterpret_cast<void**>(&g_origSend))) {
+    if (InstallHook("Ws2_32.dll", "send", reinterpret_cast<void*>(hkSend), reinterpret_cast<void**>(&g_origWinsockSend))) {
         anyHooked = true;
     }
-    if (InstallHook("Ws2_32.dll", "WSASend", reinterpret_cast<void*>(hkWSASend), reinterpret_cast<void**>(&g_origWSASend))) {
+    if (InstallHook("Ws2_32.dll", "WSASend", reinterpret_cast<void*>(hkWSASend), reinterpret_cast<void**>(&g_origWinsockWSASend))) {
         anyHooked = true;
     }
-    if (InstallHook("Ws2_32.dll", "recv", reinterpret_cast<void*>(hkRecv), reinterpret_cast<void**>(&g_origRecv))) {
+    if (InstallHook("Ws2_32.dll", "recv", reinterpret_cast<void*>(hkRecv), reinterpret_cast<void**>(&g_origWinsockRecv))) {
         anyHooked = true;
     }
-    if (InstallHook("Ws2_32.dll", "WSARecv", reinterpret_cast<void*>(hkWSARecv), reinterpret_cast<void**>(&g_origWSARecv))) {
+    if (InstallHook("Ws2_32.dll", "WSARecv", reinterpret_cast<void*>(hkWSARecv), reinterpret_cast<void**>(&g_origWinsockWSARecv))) {
         anyHooked = true;
     }
 
