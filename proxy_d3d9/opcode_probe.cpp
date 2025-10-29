@@ -461,12 +461,14 @@ void LogWinsockSendSignature(const char* apiName) {
 
     fmt::memory_buffer buf;
     fmt::format_to(buf,
-        "[OpcodeProbe][winsock][send] sig=0x{} enc={} mid={} deep={} api={}",
+        "[OpcodeProbe][winsock][send] sig=0x{} enc={} mid={} deep={}",
         ToHex(sig, 16).value,
         encStr,
         midStr,
-        deepStr,
-        apiName ? apiName : "?");
+        deepStr);
+    if (apiName && apiName[0] != '\0') {
+        fmt::format_to(buf, " api={}", apiName);
+    }
 
     if (g_config.hasDeepHint) {
         fmt::format_to(buf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
@@ -478,13 +480,13 @@ void LogWinsockSendSignature(const char* apiName) {
     if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
         fmt::memory_buffer matchBuf;
         fmt::format_to(matchBuf,
-            "[ASQ] Spirit-Healer Query SEND matched (sig=0x{} deep={}",
+            "[ASQ] Spirit-Healer Query SEND matched (sig=0x{} ) deep={}",
             ToHex(sig, 16).value,
             deepStr);
         if (g_config.hasDeepHint) {
             fmt::format_to(matchBuf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
         }
-        fmt::format_to(matchBuf, ")\n");
+        fmt::format_to(matchBuf, "\n");
         Log(matchBuf);
     }
 }
