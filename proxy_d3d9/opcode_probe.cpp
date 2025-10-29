@@ -257,6 +257,28 @@ namespace {
         return values;
     }
 
+    std::string JoinStrings(const std::vector<std::string>& values) {
+        std::string result;
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) {
+                result.push_back(',');
+            }
+            result.append(values[i]);
+        }
+        return result;
+    }
+
+    std::string JoinPorts(const std::vector<std::uint16_t>& ports) {
+        std::string result;
+        for (std::size_t i = 0; i < ports.size(); ++i) {
+            if (i > 0) {
+                result.push_back(',');
+            }
+            result += std::to_string(static_cast<unsigned int>(ports[i]));
+        }
+        return result;
+    }
+
     void ApplyConfigValue(ConfigState& state, const std::string& key, const std::string& value, std::size_t lineNumber) {
         if (!state.config) {
             return;
@@ -743,11 +765,11 @@ int WSAAPI hkWSARecv(
             auto socketValue = static_cast<std::uintptr_t>(socket);
             std::string hostDesc = "*";
             if (g_config.hasWorldHosts) {
-                hostDesc = fmt::format("{}", fmt::join(g_config.worldHosts.begin(), g_config.worldHosts.end(), ","));
+                hostDesc = JoinStrings(g_config.worldHosts);
             }
             std::string portDesc = "*";
             if (g_config.hasWorldPorts) {
-                portDesc = fmt::format("{}", fmt::join(g_config.worldPorts.begin(), g_config.worldPorts.end(), ","));
+                portDesc = JoinPorts(g_config.worldPorts);
             }
             ProbeLogFormatLine("[OpcodeProbe] Tracking world socket {}:{} (socket=0x{})", hostDesc, portDesc, ToHex(socketValue, static_cast<int>(sizeof(SOCKET) * 2)).value);
         }
