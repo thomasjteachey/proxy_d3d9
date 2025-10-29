@@ -18,6 +18,7 @@
 #include <Psapi.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <WinInet.h>
 
 #include <algorithm>
 #include <cctype>
