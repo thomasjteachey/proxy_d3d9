@@ -18,6 +18,7 @@
 #include <Psapi.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <WinInet.h>
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +89,11 @@ void ProbeLogLine(std::string_view message);
 template <typename... Args>
 void ProbeLogFormatLine(const char* fmtStr, Args&&... args) {
     ProbeLogLine(fmt::format(fmtStr, std::forward<Args>(args)...));
+}
+
+template <typename... Args>
+void LogFormatLine(const char* fmtStr, Args&&... args) {
+    LogLine(fmt::format(fmtStr, std::forward<Args>(args)...));
 }
 
 struct HexString {
@@ -463,6 +469,7 @@ void LogWinsockSendSignature(const char* apiName) {
     if (g_config.hasDeepHint) {
         line += fmt::format(" hint=wow+{}", ToHex(g_config.deepHint, 6).value);
     }
+}
 
     ProbeLogLine(line);
 
