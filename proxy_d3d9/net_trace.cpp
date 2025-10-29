@@ -52,8 +52,6 @@ struct Stat { uint32_t count = 0, firstSeenFrame = 0; };
 
 static std::unordered_map<uint32_t, Stat> gHist;
 static std::atomic<uint32_t> gFrameId{ 0 };
-static std::atomic<uint32_t> gCallsThisFrame{ 0 };
-static std::atomic<uint32_t> gBytesThisFrame{ 0 };
 
 static bool EdgePressed(int vk) {
     static SHORT prev[256] = {};
@@ -79,8 +77,6 @@ namespace NetTrace {
         if (s.count == 0) s.firstSeenFrame = gFrameId.load();
         s.count++;
 
-        gCallsThisFrame.fetch_add(1);
-        gBytesThisFrame.fetch_add((uint32_t)nbytes);
     }
 
     static void DumpTopInternal(int maxCount) {
@@ -101,12 +97,6 @@ namespace NetTrace {
 
     void OnFrameBoundary() {
         if (EdgePressed(VK_F8)) DumpTopInternal(20);
-
-        const uint32_t id = gFrameId.load();
-        const uint32_t calls = gCallsThisFrame.exchange(0);
-        const uint32_t bytes = gBytesThisFrame.exchange(0);
-        if (calls | bytes)
-            logf("[ClientFix][NET] frame=%u recvCalls=%u bytes=%u", id, calls, bytes);
 
         gFrameId.fetch_add(1);
     }
