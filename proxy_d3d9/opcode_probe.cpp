@@ -19,6 +19,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -26,59 +27,57 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <intrin.h>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <vector>
+#include <limits>
 
 #include "MinHook.h"
 #include "fmt/format.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Psapi.lib")
-#pragma intrinsic(_ReturnAddress)
 
 namespace {
 
 enum class ProbeMode {
     Off,
     Discover,
-    Sender,
+    Winsock,
 };
 
-constexpr unsigned kSpiritHealerOpcode = 0x02E2;
+extern "C" USHORT NTAPI RtlCaptureStackBackTrace(
+    ULONG FramesToSkip,
+    ULONG FramesToCapture,
+    PVOID* BackTrace,
+    PULONG BackTraceHash);
 
 std::once_flag g_initOnce;
 ProbeMode g_mode = ProbeMode::Off;
 HMODULE g_wowModule = nullptr;
 std::uintptr_t g_wowBase = 0;
 std::size_t g_wowSize = 0;
-std::uint32_t g_senderRva = 0;
-std::uint32_t g_callerRva = 0;
+using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
+Send_t g_origWinsockSend = nullptr;
 
 using WSASend_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
-WSASend_t g_origWSASend = nullptr;
+WSASend_t g_origWinsockWSASend = nullptr;
 
-using Sender_t = int(__thiscall*)(void*, void*);
-Sender_t g_origSender = nullptr;
-void* g_origCaller = nullptr;
+using Recv_t = int (WSAAPI*)(SOCKET, char*, int, int);
+Recv_t g_origWinsockRecv = nullptr;
 
-struct FlagSpec {
-    std::string name;
-    std::ptrdiff_t offset = 0;
-    int bit = -1;
-    bool absolute = false;
-};
-
-std::vector<FlagSpec> g_callerFlags;
+using WSARecv_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+WSARecv_t g_origWinsockWSARecv = nullptr;
 
 struct ProbeConfig {
     std::string phase;
-    std::string senderRva;
-    std::string callerRva;
-    std::string callerFlags;
+    std::uint64_t asqSignature = 0;
+    bool hasAsqSignature = false;
+    std::uint32_t deepHint = 0;
+    bool hasDeepHint = false;
 };
+
+ProbeConfig g_config;
 
 void Log(fmt::memory_buffer& buf);
 void LogLine(std::string_view message);
@@ -122,152 +121,6 @@ std::string ToLower(std::string s) {
     return s;
 }
 
-std::vector<std::string> SplitList(std::string_view text, char delim = ',') {
-    std::vector<std::string> parts;
-    std::size_t start = 0;
-    while (start < text.size()) {
-        std::size_t end = text.find(delim, start);
-        if (end == std::string_view::npos) end = text.size();
-        std::string token(text.substr(start, end - start));
-        Trim(token);
-        if (!token.empty()) parts.push_back(std::move(token));
-        start = end + 1;
-    }
-    return parts;
-}
-
-bool ParseOffset(std::string_view text, std::ptrdiff_t& value) {
-    std::string copy(text);
-    Trim(copy);
-    if (copy.empty()) return false;
-    const char* begin = copy.c_str();
-    char* end = nullptr;
-    long long parsed = std::strtoll(begin, &end, 0);
-    if (!end || end == begin) return false;
-    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
-    if (*end != '\0') return false;
-    value = static_cast<std::ptrdiff_t>(parsed);
-    return true;
-}
-
-int ParseBitIndex(std::string_view text) {
-    std::string copy(text);
-    Trim(copy);
-    if (copy.empty()) return -1;
-    const char* begin = copy.c_str();
-    char* end = nullptr;
-    long value = std::strtol(begin, &end, 0);
-    if (!end || end == begin) return -1;
-    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
-    if (*end != '\0') return -1;
-    return static_cast<int>(value);
-}
-
-bool SafeReadByte(const void* address, std::uint8_t& value) {
-    __try {
-        value = *reinterpret_cast<const std::uint8_t*>(address);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-
-    return false;
-}
-
-bool SafeReadDword(const void* address, std::uint32_t& value) {
-    __try {
-        value = *reinterpret_cast<const std::uint32_t*>(address);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-
-    return false;
-}
-
-void ParseCallerFlags(std::string_view text) {
-    g_callerFlags.clear();
-    if (text.empty()) return;
-
-    auto entries = SplitList(text);
-    for (const auto& entry : entries) {
-        auto pos = entry.find('@');
-        if (pos == std::string::npos) {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Ignoring caller_flags entry '{}' (missing '@')\n", entry);
-            Log(buf);
-            continue;
-        }
-
-        std::string name = entry.substr(0, pos);
-        Trim(name);
-        if (name.empty()) {
-            name = entry.substr(pos + 1);
-            Trim(name);
-        }
-
-        std::string target = entry.substr(pos + 1);
-        Trim(target);
-
-        bool absolute = false;
-        if (target.rfind("abs:", 0) == 0) {
-            absolute = true;
-            target.erase(0, 4);
-            Trim(target);
-        }
-
-        int bit = -1;
-        auto bitPos = target.find('|');
-        if (bitPos != std::string::npos) {
-            std::string bitText = target.substr(bitPos + 1);
-            bit = ParseBitIndex(bitText);
-            target.erase(bitPos);
-            Trim(target);
-        }
-
-        std::ptrdiff_t offset = 0;
-        if (!ParseOffset(target, offset)) {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Failed to parse caller_flags entry '{}' offset '{}'\n", entry, target);
-            Log(buf);
-            continue;
-        }
-
-        FlagSpec spec;
-        spec.name = name;
-        spec.offset = offset;
-        spec.bit = bit;
-        spec.absolute = absolute;
-        g_callerFlags.push_back(std::move(spec));
-    }
-
-    if (!g_callerFlags.empty()) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] caller_flags configured:");
-        for (const auto& spec : g_callerFlags) {
-            long long offValue = static_cast<long long>(spec.offset);
-            unsigned long long absValue = offValue >= 0 ? static_cast<unsigned long long>(offValue)
-                : static_cast<unsigned long long>(-offValue);
-            std::string hex = ToHex(absValue, 0).value;
-            if (offValue < 0) {
-                hex.insert(hex.begin(), '-');
-                hex.insert(hex.begin() + 1, '0');
-                hex.insert(hex.begin() + 2, 'x');
-            }
-            else {
-                hex.insert(hex.begin(), '0');
-                hex.insert(hex.begin() + 1, 'x');
-            }
-            fmt::format_to(buf, " {}@{}{}", spec.name, spec.absolute ? "abs:" : "", hex);
-            if (spec.bit >= 0) fmt::format_to(buf, "|{}", spec.bit);
-        }
-        fmt::format_to(buf, "\n");
-        Log(buf);
-    }
-}
-
 void Log(fmt::memory_buffer& buf) {
     auto text = fmt::to_string(buf);
     OutputDebugStringA(text.c_str());
@@ -308,7 +161,31 @@ std::string ResolveConfigPath() {
 struct ConfigState {
     ProbeConfig* config = nullptr;
     bool recognized = false;
+    std::string section;
 };
+
+bool ParseUint64(const std::string& text, std::uint64_t& value) {
+    const char* str = text.c_str();
+    char* end = nullptr;
+    unsigned long long parsed = _strtoui64(str, &end, 0);
+    if (!str || end == str || (end && *end != '\0')) {
+        return false;
+    }
+    value = static_cast<std::uint64_t>(parsed);
+    return true;
+}
+
+bool ParseUint32(const std::string& text, std::uint32_t& value) {
+    std::uint64_t temp = 0;
+    if (!ParseUint64(text, temp)) {
+        return false;
+    }
+    if (temp > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    value = static_cast<std::uint32_t>(temp);
+    return true;
+}
 
 void ApplyConfigValue(ConfigState& state, const std::string& key, const std::string& value, std::size_t lineNumber) {
     if (!state.config) {
@@ -317,25 +194,44 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
 
     auto lowerKey = ToLower(key);
 
-    if (lowerKey == "phase") {
+    if ((state.section.empty() || state.section == "probe") && lowerKey == "phase") {
         state.config->phase = value;
         state.recognized = true;
     }
-    else if (lowerKey == "sender_rva") {
-        state.config->senderRva = value;
-        state.recognized = true;
+    else if (state.section == "watch" && lowerKey == "asq_sig") {
+        std::uint64_t parsed = 0;
+        if (ParseUint64(value, parsed)) {
+            state.config->asqSignature = parsed;
+            state.config->hasAsqSignature = true;
+            state.recognized = true;
+        }
+        else {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Failed to parse asq_sig on line {}\n", lineNumber);
+            Log(buf);
+        }
     }
-    else if (lowerKey == "caller_rva") {
-        state.config->callerRva = value;
-        state.recognized = true;
-    }
-    else if (lowerKey == "caller_flags") {
-        state.config->callerFlags = value;
-        state.recognized = true;
+    else if (state.section == "watch" && lowerKey == "deep_hint") {
+        std::uint32_t parsed = 0;
+        if (ParseUint32(value, parsed)) {
+            state.config->deepHint = parsed;
+            state.config->hasDeepHint = true;
+            state.recognized = true;
+        }
+        else {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Failed to parse deep_hint on line {}\n", lineNumber);
+            Log(buf);
+        }
     }
     else {
         fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+        if (!state.section.empty()) {
+            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' in [{}] on line {}\n", key, state.section, lineNumber);
+        }
+        else {
+            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+        }
         Log(buf);
     }
 }
@@ -379,6 +275,14 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
 
         Trim(line);
         if (line.empty()) {
+            continue;
+        }
+
+        if (!line.empty() && line.front() == '[' && line.back() == ']') {
+            flushPending(lineNumber);
+            std::string section = line.substr(1, line.size() - 2);
+            Trim(section);
+            state.section = ToLower(section);
             continue;
         }
 
@@ -465,14 +369,14 @@ std::string DescribeAddress(void* address) {
     return fmt::format("0x{}", ToHex(addr, 8).value);
 }
 
-void LogDiscoverStack() {
+void LogDiscoverStack(const char* apiName) {
     constexpr USHORT kMaxFrames = 16;
     void* frames[kMaxFrames] = {};
     USHORT captured = CaptureStackBackTrace(0, kMaxFrames, frames, nullptr);
     if (captured == 0) return;
 
     fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe][discover] WSASend stack:");
+    fmt::format_to(buf, "[OpcodeProbe][discover] {} stack:", apiName);
     USHORT start = captured > 1 ? 1 : 0;
     for (USHORT i = start; i < captured; ++i) {
         auto desc = DescribeAddress(frames[i]);
@@ -482,218 +386,215 @@ void LogDiscoverStack() {
     Log(buf);
 }
 
+std::string FormatWowFrame(ULONG_PTR rva) {
+    if (rva == 0) {
+        return "wow+??????";
+    }
+    return fmt::format("wow+{}", ToHex(rva, 6).value);
+}
+
+ULONG_PTR WowFrameRva(std::size_t n_wow_frame) {
+    if (!g_wowBase || !g_wowSize) {
+        return 0;
+    }
+
+    void* frames[64] = {};
+    constexpr ULONG frameCount = static_cast<ULONG>(sizeof(frames) / sizeof(frames[0]));
+    USHORT captured = RtlCaptureStackBackTrace(0, frameCount, frames, nullptr);
+    if (captured == 0) {
+        return 0;
+    }
+
+    const std::uintptr_t lo = g_wowBase;
+    const std::uintptr_t hi = g_wowBase + g_wowSize;
+    std::size_t seen = 0;
+    for (USHORT i = 0; i < captured; ++i) {
+        auto addr = reinterpret_cast<std::uintptr_t>(frames[i]);
+        if (addr >= lo && addr < hi) {
+            if (seen == n_wow_frame) {
+                return static_cast<ULONG_PTR>(addr - lo);
+            }
+            ++seen;
+        }
+    }
+
+    return 0;
+}
+
+std::uint64_t StackSig() {
+    if (!g_wowBase || !g_wowSize) {
+        return 0;
+    }
+
+    void* frames[32] = {};
+    constexpr ULONG frameCount = static_cast<ULONG>(sizeof(frames) / sizeof(frames[0]));
+    USHORT captured = RtlCaptureStackBackTrace(0, frameCount, frames, nullptr);
+    if (captured == 0) {
+        return 0;
+    }
+
+    const std::uintptr_t lo = g_wowBase;
+    const std::uintptr_t hi = g_wowBase + g_wowSize;
+
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (USHORT i = 0; i < captured; ++i) {
+        auto addr = reinterpret_cast<std::uintptr_t>(frames[i]);
+        if (addr >= lo && addr < hi) {
+            std::uint32_t rva = static_cast<std::uint32_t>(addr - lo);
+            hash ^= rva;
+            hash *= 0x100000001B3ULL;
+        }
+    }
+
+    return hash;
+}
+
+void LogWinsockSendSignature(const char* apiName) {
+    auto sig = StackSig();
+    auto enc = WowFrameRva(0);
+    auto mid = WowFrameRva(4);
+    auto deep = WowFrameRva(8);
+    auto encStr = FormatWowFrame(enc);
+    auto midStr = FormatWowFrame(mid);
+    auto deepStr = FormatWowFrame(deep);
+
+    fmt::memory_buffer buf;
+    fmt::format_to(buf,
+        "[OpcodeProbe][winsock][send] sig=0x{} enc={} mid={} deep={} api={}",
+        ToHex(sig, 16).value,
+        encStr,
+        midStr,
+        deepStr,
+        apiName ? apiName : "?");
+
+    if (g_config.hasDeepHint) {
+        fmt::format_to(buf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
+    }
+
+    fmt::format_to(buf, "\n");
+    Log(buf);
+
+    if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
+        fmt::memory_buffer matchBuf;
+        fmt::format_to(matchBuf,
+            "[ASQ] Spirit-Healer Query SEND matched (sig=0x{} deep={}",
+            ToHex(sig, 16).value,
+            deepStr);
+        if (g_config.hasDeepHint) {
+            fmt::format_to(matchBuf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
+        }
+        fmt::format_to(matchBuf, ")\n");
+        Log(matchBuf);
+    }
+}
+
+int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("send");
+    }
+    else if (g_mode == ProbeMode::Winsock && buffer && length > 0) {
+        LogWinsockSendSignature("send");
+    }
+
+    return g_origWinsockSend ? g_origWinsockSend(s, buffer, length, flags) : SOCKET_ERROR;
+}
+
 int WSAAPI hkWSASend(
     SOCKET s, LPWSABUF buffers, DWORD bufferCount, LPDWORD bytesSent,
     DWORD flags, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
 {
     if (g_mode == ProbeMode::Discover) {
-        LogDiscoverStack();
+        LogDiscoverStack("WSASend");
     }
-    return g_origWSASend ? g_origWSASend(s, buffers, bufferCount, bytesSent, flags, overlapped, completion) : SOCKET_ERROR;
-}
-
-void LogPacket(void* packet, void* caller) {
-    if (!packet) return;
-    auto base = reinterpret_cast<std::uint8_t*>(packet);
-
-    std::uint8_t* storage = *reinterpret_cast<std::uint8_t**>(base);
-    if (!storage) return;
-
-    std::uint32_t writePos = *reinterpret_cast<std::uint32_t*>(base + 12);
-    if (writePos < 4 || writePos > (1u << 16)) {
-        return;
-    }
-
-    std::uint16_t opcode = *reinterpret_cast<std::uint16_t*>(storage + 2);
-    std::string callerDesc = DescribeAddress(caller);
-
-    fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe][sender] opcode=0x{} len={} packet={} caller={}",
-        ToHex(opcode, 4).value,
-        writePos,
-        ToHexLower(reinterpret_cast<std::uintptr_t>(packet), sizeof(void*) * 2).value,
-        callerDesc);
-    if (opcode == kSpiritHealerOpcode) {
-        fmt::format_to(buf, " <<< CMSG_AREA_SPIRIT_HEALER_QUERY");
-    }
-
-    fmt::format_to(buf, "\n");
-    Log(buf);
-}
-
-void __stdcall LogSpiritHealerCaller(void* self, void* stackBase) {
-    if (g_mode != ProbeMode::Sender) {
-        return;
-    }
-
-    auto selfValue = reinterpret_cast<std::uintptr_t>(self);
-    void* retAddr = stackBase ? *reinterpret_cast<void**>(stackBase) : nullptr;
-
-    fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe][caller] this=0x{}", ToHexLower(selfValue, sizeof(void*) * 2).value);
-
-    if (retAddr) {
-        fmt::format_to(buf, " ret={}", DescribeAddress(retAddr));
-    }
-
-    if (stackBase) {
-        auto* values = reinterpret_cast<std::uint32_t*>(stackBase);
-        constexpr int kArgsToLog = 4;
-        fmt::format_to(buf, " args=");
-        for (int i = 1; i <= kArgsToLog; ++i) {
-            if (i == 1) fmt::format_to(buf, "[");
-            else fmt::format_to(buf, ",");
-            std::uint32_t raw = values[i];
-            fmt::format_to(buf, "arg{}=0x{}({})", i - 1, ToHex(raw, 8).value, raw ? 1 : 0);
-        }
-        fmt::format_to(buf, "]");
-    }
-
-    if (!g_callerFlags.empty()) {
-        fmt::format_to(buf, " flags={");
-        bool first = true;
-        for (const auto& spec : g_callerFlags) {
-            if (!first) fmt::format_to(buf, " ");
-            first = false;
-
-            const void* address = nullptr;
-            if (spec.absolute) {
-                if (g_wowBase) {
-                    address = reinterpret_cast<const void*>(g_wowBase + spec.offset);
-                }
-            }
-            else if (self) {
-                address = reinterpret_cast<const void*>(reinterpret_cast<const std::uint8_t*>(self) + spec.offset);
-            }
-
-            bool haveValue = false;
-            int value = 0;
-            if (address) {
-                if (spec.bit >= 0) {
-                    std::uint32_t raw = 0;
-                    if (SafeReadDword(address, raw)) {
-                        value = ((raw >> spec.bit) & 1) ? 1 : 0;
-                        haveValue = true;
-                    }
-                }
-                else {
-                    std::uint8_t raw = 0;
-                    if (SafeReadByte(address, raw)) {
-                        value = raw ? 1 : 0;
-                        haveValue = true;
-                    }
-                }
-            }
-
-            if (haveValue) {
-                fmt::format_to(buf, "{}={}", spec.name, value);
-            }
-            else {
-                fmt::format_to(buf, "{}=?", spec.name);
+    else if (g_mode == ProbeMode::Winsock && buffers && bufferCount > 0) {
+        bool hasData = false;
+        for (DWORD i = 0; i < bufferCount; ++i) {
+            if (buffers[i].buf && buffers[i].len > 0) {
+                hasData = true;
+                break;
             }
         }
-        fmt::format_to(buf, "}");
-    }
-    else {
-        fmt::format_to(buf, " flags=none");
+        if (hasData) {
+            LogWinsockSendSignature("WSASend");
+        }
     }
 
-    fmt::format_to(buf, "\n");
-    Log(buf);
+    return g_origWinsockWSASend ? g_origWinsockWSASend(s, buffers, bufferCount, bytesSent, flags, overlapped, completion) : SOCKET_ERROR;
 }
 
-extern "C" __declspec(naked) void hkSpiritHealerCaller() {
-    __asm {
-        pushfd
-        pushad
-        mov eax, ecx
-        lea edx, [esp + 32 + 4]
-        push edx
-        push eax
-        call LogSpiritHealerCaller
-        popad
-        popfd
-        jmp g_origCaller
+int WSAAPI hkRecv(SOCKET s, char* buffer, int length, int flags) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("recv");
     }
+
+    return g_origWinsockRecv ? g_origWinsockRecv(s, buffer, length, flags) : SOCKET_ERROR;
 }
 
-int __fastcall hkSender(void* self, void*, void* packet) {
-    if (g_mode == ProbeMode::Sender) {
-        void* caller = _ReturnAddress();
-        LogPacket(packet, caller);
+int WSAAPI hkWSARecv(
+    SOCKET s, LPWSABUF buffers, DWORD bufferCount, LPDWORD bytesRecvd,
+    LPDWORD flags, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
+{
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("WSARecv");
     }
-    return g_origSender ? g_origSender(self, packet) : 0;
+
+    return g_origWinsockWSARecv ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
 }
 
-bool InstallDiscoverHook() {
-    HMODULE ws2 = GetModuleHandleA("Ws2_32.dll");
-    if (!ws2) ws2 = LoadLibraryA("Ws2_32.dll");
-    if (!ws2) {
-        LogLine("[OpcodeProbe] Failed to load Ws2_32.dll");
+bool InstallHook(const char* moduleName, const char* procName, void* detour, void** original) {
+    HMODULE module = GetModuleHandleA(moduleName);
+    if (!module) module = LoadLibraryA(moduleName);
+    if (!module) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] Failed to load {}\n", moduleName);
+        Log(buf);
         return false;
     }
 
-    auto target = reinterpret_cast<LPVOID>(GetProcAddress(ws2, "WSASend"));
+    auto target = reinterpret_cast<void*>(GetProcAddress(module, procName));
     if (!target) {
-        LogLine("[OpcodeProbe] WSASend not found");
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] {} not found in {}\n", procName, moduleName);
+        Log(buf);
         return false;
     }
 
-    if (MH_CreateHook(target, hkWSASend, reinterpret_cast<LPVOID*>(&g_origWSASend)) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_CreateHook failed for WSASend");
+    if (MH_CreateHook(target, detour, original) != MH_OK) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] MH_CreateHook failed for {}\n", procName);
+        Log(buf);
         return false;
     }
     if (MH_EnableHook(target) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_EnableHook failed for WSASend");
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] MH_EnableHook failed for {}\n", procName);
+        Log(buf);
         return false;
     }
 
-    LogLine("[OpcodeProbe] Discover mode active (WSASend)");
     return true;
 }
 
-bool InstallSenderHook() {
-    if (!g_senderRva || !g_wowBase) {
-        LogLine("[OpcodeProbe] Sender RVA not configured");
-        return false;
+bool InstallWinsockHooks() {
+    bool anyHooked = false;
+    if (InstallHook("Ws2_32.dll", "send", reinterpret_cast<void*>(hkSend), reinterpret_cast<void**>(&g_origWinsockSend))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "WSASend", reinterpret_cast<void*>(hkWSASend), reinterpret_cast<void**>(&g_origWinsockWSASend))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "recv", reinterpret_cast<void*>(hkRecv), reinterpret_cast<void**>(&g_origWinsockRecv))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "WSARecv", reinterpret_cast<void*>(hkWSARecv), reinterpret_cast<void**>(&g_origWinsockWSARecv))) {
+        anyHooked = true;
     }
 
-    auto target = reinterpret_cast<void*>(g_wowBase + g_senderRva);
-    if (MH_CreateHook(target, hkSender, reinterpret_cast<void**>(&g_origSender)) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_CreateHook failed for sender RVA");
-        return false;
-    }
-    if (MH_EnableHook(target) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_EnableHook failed for sender RVA");
-        return false;
+    if (!anyHooked) {
+        LogLine("[OpcodeProbe] Failed to install Winsock hooks");
     }
 
-    fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe] Sender mode active at wow+0x{}\n", ToHex(g_senderRva, 6).value);
-    Log(buf);
-    return true;
-}
-
-bool InstallCallerHook() {
-    if (!g_callerRva || !g_wowBase) {
-        LogLine("[OpcodeProbe] Caller RVA not configured");
-        return false;
-    }
-
-    auto target = reinterpret_cast<void*>(g_wowBase + g_callerRva);
-    if (MH_CreateHook(target, reinterpret_cast<LPVOID>(hkSpiritHealerCaller), reinterpret_cast<LPVOID*>(&g_origCaller)) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_CreateHook failed for caller RVA");
-        return false;
-    }
-    if (MH_EnableHook(target) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_EnableHook failed for caller RVA");
-        return false;
-    }
-
-    fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe] Caller hook active at wow+0x{}\n", ToHex(g_callerRva, 6).value);
-    Log(buf);
-    return true;
+    return anyHooked;
 }
 
 bool QueryModuleBounds() {
@@ -714,58 +615,37 @@ bool QueryModuleBounds() {
     return true;
 }
 
-std::uint32_t ParseSenderRva(std::string_view text) {
-    if (text.empty()) return 0;
-    const char* begin = text.data();
-    char* end = nullptr;
-    unsigned long value = std::strtoul(begin, &end, 0);
-    if (!end || end == begin) return 0;
-    return static_cast<std::uint32_t>(value);
-}
-
 void Configure() {
     if (!QueryModuleBounds()) {
         return;
     }
 
-    ProbeConfig config;
+    g_config = ProbeConfig{};
     std::string configPath;
-    if (!LoadConfigFromFile(config, configPath)) {
+    if (!LoadConfigFromFile(g_config, configPath)) {
         return;
     }
 
-    std::string lower = ToLower(config.phase);
+    std::string lower = ToLower(g_config.phase);
     if (lower == "discover") {
         g_mode = ProbeMode::Discover;
-        InstallDiscoverHook();
-        return;
-    }
-    if (lower == "sender") {
-        g_senderRva = ParseSenderRva(config.senderRva);
-        if (!g_senderRva) {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] sender_rva missing or invalid in '{}'\n", configPath);
-            Log(buf);
-            return;
-        }
-        g_callerRva = ParseSenderRva(config.callerRva);
-        if (!config.callerRva.empty() && !g_callerRva) {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] caller_rva invalid ('{}')\n", config.callerRva);
-            Log(buf);
-        }
-        ParseCallerFlags(config.callerFlags);
-        g_mode = ProbeMode::Sender;
-        InstallSenderHook();
-        if (g_callerRva) {
-            InstallCallerHook();
+        if (InstallWinsockHooks()) {
+            LogLine("[OpcodeProbe] Discover mode active (Winsock stack traces)");
         }
         return;
     }
 
-    if (!config.phase.empty()) {
+    if (lower.empty() || lower == "winsock") {
+        g_mode = ProbeMode::Winsock;
+        if (InstallWinsockHooks()) {
+            LogLine("[OpcodeProbe] Winsock stack signature logging active");
+        }
+        return;
+    }
+
+    if (!g_config.phase.empty()) {
         fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Unknown phase '{}' in '{}'\n", config.phase, configPath);
+        fmt::format_to(buf, "[OpcodeProbe] Unknown phase '{}' in '{}'\n", g_config.phase, configPath);
         Log(buf);
     }
 }
