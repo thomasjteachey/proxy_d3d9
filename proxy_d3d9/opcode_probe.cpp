@@ -83,8 +83,13 @@ struct ProbeConfig {
 ProbeConfig g_config;
 std::atomic<std::uint32_t> g_asqCount{0};
 
-void LogString(std::string_view text);
-void LogLine(std::string_view message);
+void ProbeLogString(std::string_view text);
+void ProbeLogLine(std::string_view message);
+
+template <typename... Args>
+void ProbeLogFormatLine(const char* fmtStr, Args&&... args) {
+    ProbeLogLine(fmt::format(fmtStr, std::forward<Args>(args)...));
+}
 
 template <typename... Args>
 void LogFormatLine(const char* fmtStr, Args&&... args) {
@@ -130,13 +135,13 @@ std::string ToLower(std::string s) {
     return s;
 }
 
-void LogLine(std::string_view message) {
+void ProbeLogLine(std::string_view message) {
     std::string text(message);
     text.push_back('\n');
-    LogString(text);
+    ProbeLogString(text);
 }
 
-void LogString(std::string_view text) {
+void ProbeLogString(std::string_view text) {
     std::string owned(text);
     OutputDebugStringA(owned.c_str());
 }
@@ -145,7 +150,7 @@ std::string ResolveConfigPath() {
     HMODULE module = nullptr;
     if (!GetModuleHandleExA(
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&LogLine), &module)) {
+        reinterpret_cast<LPCSTR>(&ProbeLogLine), &module)) {
         return {};
     }
 
@@ -215,7 +220,7 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
             state.recognized = true;
         }
         else {
-            LogFormatLine("[OpcodeProbe] Failed to parse asq_sig on line {}", lineNumber);
+            ProbeLogFormatLine("[OpcodeProbe] Failed to parse asq_sig on line {}", lineNumber);
         }
     }
     else if (state.section == "watch" && lowerKey == "deep_hint") {
@@ -226,15 +231,15 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
             state.recognized = true;
         }
         else {
-            LogFormatLine("[OpcodeProbe] Failed to parse deep_hint on line {}", lineNumber);
+            ProbeLogFormatLine("[OpcodeProbe] Failed to parse deep_hint on line {}", lineNumber);
         }
     }
     else {
         if (!state.section.empty()) {
-            LogFormatLine("[OpcodeProbe] Unknown config key '{}' in [{}] on line {}", key, state.section, lineNumber);
+            ProbeLogFormatLine("[OpcodeProbe] Unknown config key '{}' in [{}] on line {}", key, state.section, lineNumber);
         }
         else {
-            LogFormatLine("[OpcodeProbe] Unknown config key '{}' on line {}", key, lineNumber);
+            ProbeLogFormatLine("[OpcodeProbe] Unknown config key '{}' on line {}", key, lineNumber);
         }
     }
 }
@@ -242,13 +247,13 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
 bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
     pathOut = ResolveConfigPath();
     if (pathOut.empty()) {
-        LogLine("[OpcodeProbe] Failed to resolve opcode_probe.cfg path");
+        ProbeLogLine("[OpcodeProbe] Failed to resolve opcode_probe.cfg path");
         return false;
     }
 
     std::ifstream file(pathOut);
     if (!file.is_open()) {
-        LogFormatLine("[OpcodeProbe] Config file '{}' not found; probe disabled", pathOut);
+        ProbeLogFormatLine("[OpcodeProbe] Config file '{}' not found; probe disabled", pathOut);
         return false;
     }
 
@@ -306,7 +311,7 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
 
         auto equals = line.find('=');
         if (equals == std::string::npos) {
-            LogFormatLine("[OpcodeProbe] Ignoring config line {} (missing '=')", lineNumber);
+            ProbeLogFormatLine("[OpcodeProbe] Ignoring config line {} (missing '=')", lineNumber);
             continue;
         }
 
@@ -334,10 +339,10 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
     flushPending(lineNumber);
 
     if (!state.recognized) {
-        LogFormatLine("[OpcodeProbe] Config '{}' contained no recognized settings", pathOut);
+        ProbeLogFormatLine("[OpcodeProbe] Config '{}' contained no recognized settings", pathOut);
     }
     else {
-        LogFormatLine("[OpcodeProbe] Loaded config from '{}'", pathOut);
+        ProbeLogFormatLine("[OpcodeProbe] Loaded config from '{}'", pathOut);
     }
 
     return state.recognized;
@@ -376,7 +381,7 @@ void LogDiscoverStack(const char* apiName) {
         auto desc = DescribeAddress(frames[i]);
         line += fmt::format(" {}", desc);
     }
-    LogLine(line);
+    ProbeLogLine(line);
 }
 
 std::string FormatWowFrame(ULONG_PTR rva) {
@@ -466,13 +471,13 @@ void LogWinsockSendSignature(const char* apiName) {
     }
 }
 
-    LogLine(line);
+    ProbeLogLine(line);
 
     if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
         auto count = ++g_asqCount;
         const char* apiLabel = (apiName && apiName[0] != '\0') ? apiName : "?";
 
-        LogFormatLine("[ASQ] match #{} mid={} deep={} api={}",
+        ProbeLogFormatLine("[ASQ] match #{} mid={} deep={} api={}",
             count,
             midStr,
             deepStr,
@@ -537,22 +542,22 @@ bool InstallHook(const char* moduleName, const char* procName, void* detour, voi
     HMODULE module = GetModuleHandleA(moduleName);
     if (!module) module = LoadLibraryA(moduleName);
     if (!module) {
-        LogFormatLine("[OpcodeProbe] Failed to load {}", moduleName);
+        ProbeLogFormatLine("[OpcodeProbe] Failed to load {}", moduleName);
         return false;
     }
 
     auto target = reinterpret_cast<void*>(GetProcAddress(module, procName));
     if (!target) {
-        LogFormatLine("[OpcodeProbe] {} not found in {}", procName, moduleName);
+        ProbeLogFormatLine("[OpcodeProbe] {} not found in {}", procName, moduleName);
         return false;
     }
 
     if (MH_CreateHook(target, detour, original) != MH_OK) {
-        LogFormatLine("[OpcodeProbe] MH_CreateHook failed for {}", procName);
+        ProbeLogFormatLine("[OpcodeProbe] MH_CreateHook failed for {}", procName);
         return false;
     }
     if (MH_EnableHook(target) != MH_OK) {
-        LogFormatLine("[OpcodeProbe] MH_EnableHook failed for {}", procName);
+        ProbeLogFormatLine("[OpcodeProbe] MH_EnableHook failed for {}", procName);
         return false;
     }
 
@@ -575,7 +580,7 @@ bool InstallWinsockHooks() {
     }
 
     if (!anyHooked) {
-        LogLine("[OpcodeProbe] Failed to install Winsock hooks");
+        ProbeLogLine("[OpcodeProbe] Failed to install Winsock hooks");
     }
 
     return anyHooked;
@@ -584,13 +589,13 @@ bool InstallWinsockHooks() {
 bool QueryModuleBounds() {
     g_wowModule = GetModuleHandleW(nullptr);
     if (!g_wowModule) {
-        LogLine("[OpcodeProbe] Failed to query Wow.exe module");
+        ProbeLogLine("[OpcodeProbe] Failed to query Wow.exe module");
         return false;
     }
 
     MODULEINFO info = {};
     if (!GetModuleInformation(GetCurrentProcess(), g_wowModule, &info, sizeof(info))) {
-        LogLine("[OpcodeProbe] GetModuleInformation failed");
+        ProbeLogLine("[OpcodeProbe] GetModuleInformation failed");
         return false;
     }
 
@@ -615,7 +620,7 @@ void Configure() {
     if (lower == "discover") {
         g_mode = ProbeMode::Discover;
         if (InstallWinsockHooks()) {
-            LogLine("[OpcodeProbe] Discover mode active (Winsock stack traces)");
+            ProbeLogLine("[OpcodeProbe] Discover mode active (Winsock stack traces)");
         }
         return;
     }
@@ -623,13 +628,13 @@ void Configure() {
     if (lower.empty() || lower == "winsock") {
         g_mode = ProbeMode::Winsock;
         if (InstallWinsockHooks()) {
-            LogLine("[OpcodeProbe] Winsock stack signature logging active");
+            ProbeLogLine("[OpcodeProbe] Winsock stack signature logging active");
         }
         return;
     }
 
     if (!g_config.phase.empty()) {
-        LogFormatLine("[OpcodeProbe] Unknown phase '{}' in '{}'", g_config.phase, configPath);
+        ProbeLogFormatLine("[OpcodeProbe] Unknown phase '{}' in '{}'", g_config.phase, configPath);
     }
 }
 
