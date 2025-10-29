@@ -34,6 +34,8 @@
 #include <string_view>
 #include <limits>
 #include <utility>
+#include <chrono>
+#include <vector>
 
 #include "MinHook.h"
 #include "fmt/format.h"
@@ -72,16 +74,35 @@ namespace {
     using WSARecv_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
     WSARecv_t g_origWinsockWSARecv = nullptr;
 
+    using Connect_t = int (WSAAPI*)(SOCKET, const sockaddr*, int);
+    Connect_t g_origWinsockConnect = nullptr;
+
+    using WSAConnect_t = int (WSAAPI*)(SOCKET, const sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
+    WSAConnect_t g_origWinsockWSAConnect = nullptr;
+
     struct ProbeConfig {
         std::string phase;
         std::uint64_t asqSignature = 0;
         bool hasAsqSignature = false;
         std::uint32_t deepHint = 0;
         bool hasDeepHint = false;
+        std::vector<std::string> worldHosts;
+        std::vector<in_addr> worldAddrs;
+        bool hasWorldHosts = false;
+        std::vector<std::uint16_t> worldPorts;
+        bool hasWorldPorts = false;
+        std::uint32_t maxPacketBytes = 48;
+        bool hasMaxPacketBytes = false;
+        std::uint32_t debounceMs = 200;
+        bool hasDebounceMs = false;
     };
 
     ProbeConfig g_config;
     std::atomic<std::uint32_t> g_asqCount{ 0 };
+    std::atomic<SOCKET> g_trackedSocket{ INVALID_SOCKET };
+    std::mutex g_dedupeMutex;
+    std::string g_lastLogLine;
+    std::chrono::steady_clock::time_point g_lastLogTime;
 
     void ProbeLogString(std::string_view text);
     void ProbeLogLine(std::string_view message);
@@ -201,6 +222,41 @@ namespace {
         return true;
     }
 
+    bool ParseUint16(const std::string& text, std::uint16_t& value) {
+        std::uint64_t temp = 0;
+        if (!ParseUint64(text, temp)) {
+            return false;
+        }
+        if (temp > std::numeric_limits<std::uint16_t>::max()) {
+            return false;
+        }
+        value = static_cast<std::uint16_t>(temp);
+        return true;
+    }
+
+    std::vector<std::string> SplitCsv(const std::string& text) {
+        std::vector<std::string> values;
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            auto comma = text.find(',', start);
+            std::string token;
+            if (comma == std::string::npos) {
+                token = text.substr(start);
+                start = text.size() + 1;
+            }
+            else {
+                token = text.substr(start, comma - start);
+                start = comma + 1;
+            }
+
+            Trim(token);
+            if (!token.empty()) {
+                values.emplace_back(std::move(token));
+            }
+        }
+        return values;
+    }
+
     void ApplyConfigValue(ConfigState& state, const std::string& key, const std::string& value, std::size_t lineNumber) {
         if (!state.config) {
             return;
@@ -232,6 +288,73 @@ namespace {
             }
             else {
                 ProbeLogFormatLine("[OpcodeProbe] Failed to parse deep_hint on line {}", lineNumber);
+            }
+        }
+        else if (state.section == "winsock" && lowerKey == "world_host") {
+            auto entries = SplitCsv(value);
+            if (entries.empty()) {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_host on line {}", lineNumber);
+                return;
+            }
+
+            std::vector<in_addr> addrs;
+            addrs.reserve(entries.size());
+            for (const auto& entry : entries) {
+                in_addr addr{};
+                if (InetPtonA(AF_INET, entry.c_str(), &addr) != 1) {
+                    ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_host '{}' on line {}", entry, lineNumber);
+                    return;
+                }
+                addrs.push_back(addr);
+            }
+
+            state.config->worldHosts = std::move(entries);
+            state.config->worldAddrs = std::move(addrs);
+            state.config->hasWorldHosts = true;
+            state.recognized = true;
+        }
+        else if (state.section == "winsock" && lowerKey == "world_port") {
+            auto entries = SplitCsv(value);
+            if (entries.empty()) {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_port on line {}", lineNumber);
+                return;
+            }
+
+            std::vector<std::uint16_t> ports;
+            ports.reserve(entries.size());
+            for (const auto& entry : entries) {
+                std::uint16_t parsed = 0;
+                if (!ParseUint16(entry, parsed)) {
+                    ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_port '{}' on line {}", entry, lineNumber);
+                    return;
+                }
+                ports.push_back(parsed);
+            }
+
+            state.config->worldPorts = std::move(ports);
+            state.config->hasWorldPorts = true;
+            state.recognized = true;
+        }
+        else if ((state.section == "winsock" || state.section == "filter") && lowerKey == "max_packet_bytes") {
+            std::uint32_t parsed = 0;
+            if (ParseUint32(value, parsed)) {
+                state.config->maxPacketBytes = parsed;
+                state.config->hasMaxPacketBytes = true;
+                state.recognized = true;
+            }
+            else {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse max_packet_bytes on line {}", lineNumber);
+            }
+        }
+        else if ((state.section == "winsock" || state.section == "filter") && lowerKey == "debounce_ms") {
+            std::uint32_t parsed = 0;
+            if (ParseUint32(value, parsed)) {
+                state.config->debounceMs = parsed;
+                state.config->hasDebounceMs = true;
+                state.recognized = true;
+            }
+            else {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse debounce_ms on line {}", lineNumber);
             }
         }
         else {
@@ -447,6 +570,41 @@ namespace {
         return hash;
     }
 
+    bool ShouldLogPacket(SOCKET socket, std::size_t totalLength) {
+        SOCKET tracked = g_trackedSocket.load();
+        if (tracked == INVALID_SOCKET) {
+            return false;
+        }
+        if (socket != tracked) {
+            return false;
+        }
+
+        if (g_config.maxPacketBytes > 0 && totalLength > g_config.maxPacketBytes) {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool ShouldSuppressLog(const std::string& line) {
+        if (g_config.debounceMs == 0) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(g_dedupeMutex);
+        auto now = std::chrono::steady_clock::now();
+        if (!g_lastLogLine.empty() && line == g_lastLogLine) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastLogTime);
+            if (elapsed.count() < static_cast<long long>(g_config.debounceMs)) {
+                return true;
+            }
+        }
+
+        g_lastLogLine = line;
+        g_lastLogTime = now;
+        return false;
+    }
+
     void LogWinsockSendSignature(const char* apiName) {
         auto sig = StackSig();
         auto enc = WowFrameRva(0);
@@ -470,11 +628,15 @@ namespace {
             line += fmt::format(" hint=wow+{}", ToHex(g_config.deepHint, 6).value);
         }
 
-    ProbeLogLine(line);
+        if (ShouldSuppressLog(line)) {
+            return;
+        }
 
-    if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
-        auto count = ++g_asqCount;
-        const char* apiLabel = (apiName && apiName[0] != '\0') ? apiName : "?";
+        ProbeLogLine(line);
+
+        if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
+            auto count = ++g_asqCount;
+            const char* apiLabel = (apiName && apiName[0] != '\0') ? apiName : "?";
 
         ProbeLogFormatLine("[ASQ] match #{} mid={} deep={} api={}",
             count,
@@ -489,7 +651,10 @@ int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
         LogDiscoverStack("send");
     }
     else if (g_mode == ProbeMode::Winsock && buffer && length > 0) {
-        LogWinsockSendSignature("send");
+        std::size_t totalLength = static_cast<std::size_t>(length);
+        if (ShouldLogPacket(s, totalLength)) {
+            LogWinsockSendSignature("send");
+        }
     }
 
     return g_origWinsockSend ? g_origWinsockSend(s, buffer, length, flags) : SOCKET_ERROR;
@@ -503,14 +668,15 @@ int WSAAPI hkWSASend(
         LogDiscoverStack("WSASend");
     }
     else if (g_mode == ProbeMode::Winsock && buffers && bufferCount > 0) {
+        std::size_t totalLength = 0;
         bool hasData = false;
         for (DWORD i = 0; i < bufferCount; ++i) {
             if (buffers[i].buf && buffers[i].len > 0) {
                 hasData = true;
-                break;
+                totalLength += static_cast<std::size_t>(buffers[i].len);
             }
         }
-        if (hasData) {
+        if (hasData && ShouldLogPacket(s, totalLength)) {
             LogWinsockSendSignature("WSASend");
         }
     }
@@ -536,6 +702,73 @@ int WSAAPI hkWSARecv(
 
     return g_origWinsockWSARecv ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
 }
+
+    void TryTrackWorldSocket(SOCKET socket, const sockaddr* name, int nameLen) {
+        if (!name || nameLen <= 0) {
+            return;
+        }
+
+        if (!g_config.hasWorldPorts) {
+            return;
+        }
+
+        if (name->sa_family == AF_INET && nameLen >= static_cast<int>(sizeof(sockaddr_in))) {
+            const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(name);
+            std::uint16_t port = ntohs(ipv4->sin_port);
+            bool portMatch = false;
+            for (auto configuredPort : g_config.worldPorts) {
+                if (port == configuredPort) {
+                    portMatch = true;
+                    break;
+                }
+            }
+            if (!portMatch) {
+                return;
+            }
+
+            if (g_config.hasWorldHosts) {
+                bool hostMatch = false;
+                for (const auto& configuredAddr : g_config.worldAddrs) {
+                    if (ipv4->sin_addr.S_un.S_addr == configuredAddr.S_un.S_addr) {
+                        hostMatch = true;
+                        break;
+                    }
+                }
+                if (!hostMatch) {
+                    return;
+                }
+            }
+
+            g_trackedSocket.store(socket);
+            auto socketValue = static_cast<std::uintptr_t>(socket);
+            std::string hostDesc = "*";
+            if (g_config.hasWorldHosts) {
+                hostDesc = fmt::format("{}", fmt::join(g_config.worldHosts.begin(), g_config.worldHosts.end(), ","));
+            }
+            std::string portDesc = "*";
+            if (g_config.hasWorldPorts) {
+                portDesc = fmt::format("{}", fmt::join(g_config.worldPorts.begin(), g_config.worldPorts.end(), ","));
+            }
+            ProbeLogFormatLine("[OpcodeProbe] Tracking world socket {}:{} (socket=0x{})", hostDesc, portDesc, ToHex(socketValue, static_cast<int>(sizeof(SOCKET) * 2)).value);
+        }
+    }
+
+    int WSAAPI hkConnect(SOCKET s, const sockaddr* name, int namelen) {
+        TryTrackWorldSocket(s, name, namelen);
+        return g_origWinsockConnect ? g_origWinsockConnect(s, name, namelen) : SOCKET_ERROR;
+    }
+
+    int WSAAPI hkWSAConnect(
+        SOCKET s,
+        const sockaddr* name,
+        int namelen,
+        LPWSABUF callerData,
+        LPWSABUF calleeData,
+        LPQOS sqos,
+        LPQOS gqos) {
+        TryTrackWorldSocket(s, name, namelen);
+        return g_origWinsockWSAConnect ? g_origWinsockWSAConnect(s, name, namelen, callerData, calleeData, sqos, gqos) : SOCKET_ERROR;
+    }
 
 bool InstallHook(const char* moduleName, const char* procName, void* detour, void** original) {
     HMODULE module = GetModuleHandleA(moduleName);
@@ -577,6 +810,12 @@ bool InstallWinsockHooks() {
     if (InstallHook("Ws2_32.dll", "WSARecv", reinterpret_cast<void*>(hkWSARecv), reinterpret_cast<void**>(&g_origWinsockWSARecv))) {
         anyHooked = true;
     }
+    if (InstallHook("Ws2_32.dll", "connect", reinterpret_cast<void*>(hkConnect), reinterpret_cast<void**>(&g_origWinsockConnect))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "WSAConnect", reinterpret_cast<void*>(hkWSAConnect), reinterpret_cast<void**>(&g_origWinsockWSAConnect))) {
+        anyHooked = true;
+    }
 
     if (!anyHooked) {
         ProbeLogLine("[OpcodeProbe] Failed to install Winsock hooks");
@@ -610,6 +849,12 @@ void Configure() {
 
     g_config = ProbeConfig{};
     g_asqCount.store(0);
+    g_trackedSocket.store(INVALID_SOCKET);
+    {
+        std::lock_guard<std::mutex> lock(g_dedupeMutex);
+        g_lastLogLine.clear();
+        g_lastLogTime = {};
+    }
     std::string configPath;
     if (!LoadConfigFromFile(g_config, configPath)) {
         return;
