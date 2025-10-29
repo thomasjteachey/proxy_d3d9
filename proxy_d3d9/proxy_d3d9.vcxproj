@@ -166,6 +166,7 @@
     <ClInclude Include="..\3rdparty\minhook\src\hde\table64.h" />
     <ClInclude Include="..\3rdparty\minhook\src\trampoline.h" />
     <ClInclude Include="aob_scan.h" />
+    <ClInclude Include="fmt\format.h" />
     <ClInclude Include="call_split.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="frame_fence.h" />
@@ -174,6 +175,7 @@
     <ClInclude Include="latency.h" />
     <ClInclude Include="net_split.h" />
     <ClInclude Include="net_trace.h" />
+    <ClInclude Include="opcode_probe.h" />
     <ClInclude Include="svk_scan.h" />
     <ClInclude Include="task_queue.h" />
     <ClInclude Include="timing.h" />
@@ -194,6 +196,7 @@
     <ClCompile Include="net_recv_hooks.cpp" />
     <ClCompile Include="net_split.cpp" />
     <ClCompile Include="net_trace.cpp" />
+    <ClCompile Include="opcode_probe.cpp" />
     <ClCompile Include="svk_scan.cpp" />
     <ClCompile Include="task_queue.cpp" />
     <ClCompile Include="timing.cpp" />
