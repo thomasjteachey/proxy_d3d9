@@ -20,6 +20,7 @@
 #include <WS2tcpip.h>
 
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "MinHook.h"
 #include "fmt/format.h"
@@ -52,12 +54,23 @@ HMODULE g_wowModule = nullptr;
 std::uintptr_t g_wowBase = 0;
 std::size_t g_wowSize = 0;
 std::uint32_t g_senderRva = 0;
+std::uint32_t g_callerRva = 0;
 
 using WSASend_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 WSASend_t g_origWSASend = nullptr;
 
 using Sender_t = int(__thiscall*)(void*, void*);
 Sender_t g_origSender = nullptr;
+void* g_origCaller = nullptr;
+
+struct FlagSpec {
+    std::string name;
+    std::ptrdiff_t offset = 0;
+    int bit = -1;
+    bool absolute = false;
+};
+
+std::vector<FlagSpec> g_callerFlags;
 
 struct HexString {
     std::string value;
@@ -109,6 +122,148 @@ std::string ReadEnv(const char* name) {
 std::string ToLower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
+}
+
+std::vector<std::string> SplitList(std::string_view text, char delim = ',') {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start < text.size()) {
+        std::size_t end = text.find(delim, start);
+        if (end == std::string_view::npos) end = text.size();
+        std::string token(text.substr(start, end - start));
+        Trim(token);
+        if (!token.empty()) parts.push_back(std::move(token));
+        start = end + 1;
+    }
+    return parts;
+}
+
+bool ParseOffset(std::string_view text, std::ptrdiff_t& value) {
+    std::string copy(text);
+    Trim(copy);
+    if (copy.empty()) return false;
+    const char* begin = copy.c_str();
+    char* end = nullptr;
+    long long parsed = std::strtoll(begin, &end, 0);
+    if (!end || end == begin) return false;
+    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != '\0') return false;
+    value = static_cast<std::ptrdiff_t>(parsed);
+    return true;
+}
+
+int ParseBitIndex(std::string_view text) {
+    std::string copy(text);
+    Trim(copy);
+    if (copy.empty()) return -1;
+    const char* begin = copy.c_str();
+    char* end = nullptr;
+    long value = std::strtol(begin, &end, 0);
+    if (!end || end == begin) return -1;
+    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != '\0') return -1;
+    return static_cast<int>(value);
+}
+
+bool SafeReadByte(const void* address, std::uint8_t& value) {
+    __try {
+        value = *reinterpret_cast<const std::uint8_t*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool SafeReadDword(const void* address, std::uint32_t& value) {
+    __try {
+        value = *reinterpret_cast<const std::uint32_t*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void ParseCallerFlags(std::string_view text) {
+    g_callerFlags.clear();
+    if (text.empty()) return;
+
+    auto entries = SplitList(text);
+    for (const auto& entry : entries) {
+        auto pos = entry.find('@');
+        if (pos == std::string::npos) {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Ignoring PROBE_CALLER_FLAGS entry '{}' (missing '@')\n", entry);
+            Log(buf);
+            continue;
+        }
+
+        std::string name = entry.substr(0, pos);
+        Trim(name);
+        if (name.empty()) {
+            name = entry.substr(pos + 1);
+            Trim(name);
+        }
+
+        std::string target = entry.substr(pos + 1);
+        Trim(target);
+
+        bool absolute = false;
+        if (target.rfind("abs:", 0) == 0) {
+            absolute = true;
+            target.erase(0, 4);
+            Trim(target);
+        }
+
+        int bit = -1;
+        auto bitPos = target.find('|');
+        if (bitPos != std::string::npos) {
+            std::string bitText = target.substr(bitPos + 1);
+            bit = ParseBitIndex(bitText);
+            target.erase(bitPos);
+            Trim(target);
+        }
+
+        std::ptrdiff_t offset = 0;
+        if (!ParseOffset(target, offset)) {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Failed to parse PROBE_CALLER_FLAGS entry '{}' offset '{}'\n", entry, target);
+            Log(buf);
+            continue;
+        }
+
+        FlagSpec spec;
+        spec.name = name;
+        spec.offset = offset;
+        spec.bit = bit;
+        spec.absolute = absolute;
+        g_callerFlags.push_back(std::move(spec));
+    }
+
+    if (!g_callerFlags.empty()) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] PROBE_CALLER_FLAGS configured:");
+        for (const auto& spec : g_callerFlags) {
+            long long offValue = static_cast<long long>(spec.offset);
+            unsigned long long absValue = offValue >= 0 ? static_cast<unsigned long long>(offValue)
+                : static_cast<unsigned long long>(-offValue);
+            std::string hex = ToHex(absValue, 0).value;
+            if (offValue < 0) {
+                hex.insert(hex.begin(), '-');
+                hex.insert(hex.begin() + 1, '0');
+                hex.insert(hex.begin() + 2, 'x');
+            }
+            else {
+                hex.insert(hex.begin(), '0');
+                hex.insert(hex.begin() + 1, 'x');
+            }
+            fmt::format_to(buf, " {}@{}{}", spec.name, spec.absolute ? "abs:" : "", hex);
+            if (spec.bit >= 0) fmt::format_to(buf, "|{}", spec.bit);
+        }
+        fmt::format_to(buf, "\n");
+        Log(buf);
+    }
 }
 
 void Log(fmt::memory_buffer& buf) {
@@ -199,6 +354,102 @@ void LogPacket(void* packet, void* caller) {
     Log(buf);
 }
 
+void __stdcall LogSpiritHealerCaller(void* self, void* stackBase) {
+    if (g_mode != ProbeMode::Sender) {
+        return;
+    }
+
+    auto selfValue = reinterpret_cast<std::uintptr_t>(self);
+    void* retAddr = stackBase ? *reinterpret_cast<void**>(stackBase) : nullptr;
+
+    fmt::memory_buffer buf;
+    fmt::format_to(buf, "[OpcodeProbe][caller] this=0x{}", ToHexLower(selfValue, sizeof(void*) * 2).value);
+
+    if (retAddr) {
+        fmt::format_to(buf, " ret={}", DescribeAddress(retAddr));
+    }
+
+    if (stackBase) {
+        auto* values = reinterpret_cast<std::uint32_t*>(stackBase);
+        constexpr int kArgsToLog = 4;
+        fmt::format_to(buf, " args=");
+        for (int i = 1; i <= kArgsToLog; ++i) {
+            if (i == 1) fmt::format_to(buf, "[");
+            else fmt::format_to(buf, ",");
+            std::uint32_t raw = values[i];
+            fmt::format_to(buf, "arg{}=0x{}({})", i - 1, ToHex(raw, 8).value, raw ? 1 : 0);
+        }
+        fmt::format_to(buf, "]");
+    }
+
+    if (!g_callerFlags.empty()) {
+        fmt::format_to(buf, " flags={");
+        bool first = true;
+        for (const auto& spec : g_callerFlags) {
+            if (!first) fmt::format_to(buf, " ");
+            first = false;
+
+            const void* address = nullptr;
+            if (spec.absolute) {
+                if (g_wowBase) {
+                    address = reinterpret_cast<const void*>(g_wowBase + spec.offset);
+                }
+            }
+            else if (self) {
+                address = reinterpret_cast<const void*>(reinterpret_cast<const std::uint8_t*>(self) + spec.offset);
+            }
+
+            bool haveValue = false;
+            int value = 0;
+            if (address) {
+                if (spec.bit >= 0) {
+                    std::uint32_t raw = 0;
+                    if (SafeReadDword(address, raw)) {
+                        value = ((raw >> spec.bit) & 1) ? 1 : 0;
+                        haveValue = true;
+                    }
+                }
+                else {
+                    std::uint8_t raw = 0;
+                    if (SafeReadByte(address, raw)) {
+                        value = raw ? 1 : 0;
+                        haveValue = true;
+                    }
+                }
+            }
+
+            if (haveValue) {
+                fmt::format_to(buf, "{}={}", spec.name, value);
+            }
+            else {
+                fmt::format_to(buf, "{}=?", spec.name);
+            }
+        }
+        fmt::format_to(buf, "}");
+    }
+    else {
+        fmt::format_to(buf, " flags=none");
+    }
+
+    fmt::format_to(buf, "\n");
+    Log(buf);
+}
+
+extern "C" __declspec(naked) void hkSpiritHealerCaller() {
+    __asm {
+        pushfd
+        pushad
+        mov eax, ecx
+        lea edx, [esp + 32 + 4]
+        push edx
+        push eax
+        call LogSpiritHealerCaller
+        popad
+        popfd
+        jmp g_origCaller
+    }
+}
+
 int __fastcall hkSender(void* self, void*, void* packet) {
     if (g_mode == ProbeMode::Sender) {
         void* caller = _ReturnAddress();
@@ -256,6 +507,28 @@ bool InstallSenderHook() {
     return true;
 }
 
+bool InstallCallerHook() {
+    if (!g_callerRva || !g_wowBase) {
+        LogLine("[OpcodeProbe] Caller RVA not configured");
+        return false;
+    }
+
+    auto target = reinterpret_cast<void*>(g_wowBase + g_callerRva);
+    if (MH_CreateHook(target, reinterpret_cast<LPVOID>(hkSpiritHealerCaller), reinterpret_cast<LPVOID*>(&g_origCaller)) != MH_OK) {
+        LogLine("[OpcodeProbe] MH_CreateHook failed for caller RVA");
+        return false;
+    }
+    if (MH_EnableHook(target) != MH_OK) {
+        LogLine("[OpcodeProbe] MH_EnableHook failed for caller RVA");
+        return false;
+    }
+
+    fmt::memory_buffer buf;
+    fmt::format_to(buf, "[OpcodeProbe] Caller hook active at wow+0x{}\n", ToHex(g_callerRva, 6).value);
+    Log(buf);
+    return true;
+}
+
 bool QueryModuleBounds() {
     g_wowModule = GetModuleHandleW(nullptr);
     if (!g_wowModule) {
@@ -302,8 +575,20 @@ void Configure() {
             LogLine("[OpcodeProbe] PROBE_SENDER_RVA missing or invalid");
             return;
         }
+        std::string callerText = ReadEnv("PROBE_CALLER_RVA");
+        g_callerRva = ParseSenderRva(callerText);
+        if (!callerText.empty() && !g_callerRva) {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] PROBE_CALLER_RVA invalid ('{}')\n", callerText);
+            Log(buf);
+        }
+        std::string flagText = ReadEnv("PROBE_CALLER_FLAGS");
+        ParseCallerFlags(flagText);
         g_mode = ProbeMode::Sender;
         InstallSenderHook();
+        if (g_callerRva) {
+            InstallCallerHook();
+        }
         return;
     }
 
