@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <intrin.h>
 #include <mutex>
 #include <string>
@@ -72,6 +73,13 @@ struct FlagSpec {
 
 std::vector<FlagSpec> g_callerFlags;
 
+struct ProbeConfig {
+    std::string phase;
+    std::string senderRva;
+    std::string callerRva;
+    std::string callerFlags;
+};
+
 void Log(fmt::memory_buffer& buf);
 void LogLine(std::string_view message);
 
@@ -107,19 +115,6 @@ void Trim(std::string& s) {
     std::size_t i = 0;
     while (i < s.size() && isSpace(static_cast<unsigned char>(s[i]))) ++i;
     if (i > 0) s.erase(0, i);
-}
-
-std::string ReadEnv(const char* name) {
-    DWORD required = GetEnvironmentVariableA(name, nullptr, 0);
-    if (required == 0) return {};
-    std::string value(required, '\0');
-    DWORD written = GetEnvironmentVariableA(name, value.data(), required);
-    if (written == 0) return {};
-    if (!value.empty() && value.back() == '\0') value.pop_back();
-    value.resize(written);
-    std::string copy = value;
-    Trim(copy);
-    return copy;
 }
 
 std::string ToLower(std::string s) {
@@ -201,7 +196,7 @@ void ParseCallerFlags(std::string_view text) {
         auto pos = entry.find('@');
         if (pos == std::string::npos) {
             fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Ignoring PROBE_CALLER_FLAGS entry '{}' (missing '@')\n", entry);
+            fmt::format_to(buf, "[OpcodeProbe] Ignoring caller_flags entry '{}' (missing '@')\n", entry);
             Log(buf);
             continue;
         }
@@ -235,7 +230,7 @@ void ParseCallerFlags(std::string_view text) {
         std::ptrdiff_t offset = 0;
         if (!ParseOffset(target, offset)) {
             fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Failed to parse PROBE_CALLER_FLAGS entry '{}' offset '{}'\n", entry, target);
+            fmt::format_to(buf, "[OpcodeProbe] Failed to parse caller_flags entry '{}' offset '{}'\n", entry, target);
             Log(buf);
             continue;
         }
@@ -250,7 +245,7 @@ void ParseCallerFlags(std::string_view text) {
 
     if (!g_callerFlags.empty()) {
         fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] PROBE_CALLER_FLAGS configured:");
+        fmt::format_to(buf, "[OpcodeProbe] caller_flags configured:");
         for (const auto& spec : g_callerFlags) {
             long long offValue = static_cast<long long>(spec.offset);
             unsigned long long absValue = offValue >= 0 ? static_cast<unsigned long long>(offValue)
@@ -282,6 +277,113 @@ void LogLine(std::string_view message) {
     fmt::memory_buffer buf;
     fmt::format_to(buf, "{}\n", message);
     Log(buf);
+}
+
+std::string ResolveConfigPath() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&Log), &module)) {
+        return {};
+    }
+
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(module, path, MAX_PATH)) {
+        return {};
+    }
+
+    std::string fullPath(path);
+    auto pos = fullPath.find_last_of("\\/");
+    if (pos != std::string::npos) {
+        fullPath.resize(pos + 1);
+    }
+    else {
+        fullPath.clear();
+    }
+
+    fullPath += "opcode_probe.cfg";
+    return fullPath;
+}
+
+bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
+    pathOut = ResolveConfigPath();
+    if (pathOut.empty()) {
+        LogLine("[OpcodeProbe] Failed to resolve opcode_probe.cfg path");
+        return false;
+    }
+
+    std::ifstream file(pathOut);
+    if (!file.is_open()) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] Config file '{}' not found; probe disabled\n", pathOut);
+        Log(buf);
+        return false;
+    }
+
+    bool recognized = false;
+    std::string line;
+    std::size_t lineNumber = 0;
+    while (std::getline(file, line)) {
+        ++lineNumber;
+        auto commentPos = line.find_first_of("#;");
+        if (commentPos != std::string::npos) {
+            line.erase(commentPos);
+        }
+
+        Trim(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        auto equals = line.find('=');
+        if (equals == std::string::npos) {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Ignoring config line {} (missing '=')\n", lineNumber);
+            Log(buf);
+            continue;
+        }
+
+        std::string key = line.substr(0, equals);
+        std::string value = line.substr(equals + 1);
+        Trim(key);
+        Trim(value);
+        auto lowerKey = ToLower(key);
+
+        if (lowerKey == "phase") {
+            config.phase = value;
+            recognized = true;
+        }
+        else if (lowerKey == "sender_rva") {
+            config.senderRva = value;
+            recognized = true;
+        }
+        else if (lowerKey == "caller_rva") {
+            config.callerRva = value;
+            recognized = true;
+        }
+        else if (lowerKey == "caller_flags") {
+            config.callerFlags = value;
+            recognized = true;
+        }
+        else {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+            Log(buf);
+        }
+    }
+
+    if (!recognized) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] Config '{}' contained no recognized settings\n", pathOut);
+        Log(buf);
+    }
+    else {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] Loaded config from '{}'\n", pathOut);
+        Log(buf);
+    }
+
+    return recognized;
 }
 
 std::string DescribeAddress(void* address) {
@@ -568,29 +670,33 @@ void Configure() {
         return;
     }
 
-    std::string phase = ReadEnv("PROBE_PHASE");
-    std::string lower = ToLower(phase);
+    ProbeConfig config;
+    std::string configPath;
+    if (!LoadConfigFromFile(config, configPath)) {
+        return;
+    }
+
+    std::string lower = ToLower(config.phase);
     if (lower == "discover") {
         g_mode = ProbeMode::Discover;
         InstallDiscoverHook();
         return;
     }
     if (lower == "sender") {
-        std::string senderText = ReadEnv("PROBE_SENDER_RVA");
-        g_senderRva = ParseSenderRva(senderText);
+        g_senderRva = ParseSenderRva(config.senderRva);
         if (!g_senderRva) {
-            LogLine("[OpcodeProbe] PROBE_SENDER_RVA missing or invalid");
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] sender_rva missing or invalid in '{}'\n", configPath);
+            Log(buf);
             return;
         }
-        std::string callerText = ReadEnv("PROBE_CALLER_RVA");
-        g_callerRva = ParseSenderRva(callerText);
-        if (!callerText.empty() && !g_callerRva) {
+        g_callerRva = ParseSenderRva(config.callerRva);
+        if (!config.callerRva.empty() && !g_callerRva) {
             fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] PROBE_CALLER_RVA invalid ('{}')\n", callerText);
+            fmt::format_to(buf, "[OpcodeProbe] caller_rva invalid ('{}')\n", config.callerRva);
             Log(buf);
         }
-        std::string flagText = ReadEnv("PROBE_CALLER_FLAGS");
-        ParseCallerFlags(flagText);
+        ParseCallerFlags(config.callerFlags);
         g_mode = ProbeMode::Sender;
         InstallSenderHook();
         if (g_callerRva) {
@@ -599,9 +705,9 @@ void Configure() {
         return;
     }
 
-    if (!phase.empty()) {
+    if (!config.phase.empty()) {
         fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Unknown PROBE_PHASE='{}'\n", phase);
+        fmt::format_to(buf, "[OpcodeProbe] Unknown phase '{}' in '{}'\n", config.phase, configPath);
         Log(buf);
     }
 }
