@@ -72,6 +72,9 @@ struct FlagSpec {
 
 std::vector<FlagSpec> g_callerFlags;
 
+void Log(fmt::memory_buffer& buf);
+void LogLine(std::string_view message);
+
 struct HexString {
     std::string value;
 };
@@ -173,6 +176,8 @@ bool SafeReadByte(const void* address, std::uint8_t& value) {
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+
+    return false;
 }
 
 bool SafeReadDword(const void* address, std::uint32_t& value) {
@@ -183,6 +188,8 @@ bool SafeReadDword(const void* address, std::uint32_t& value) {
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+
+    return false;
 }
 
 void ParseCallerFlags(std::string_view text) {
