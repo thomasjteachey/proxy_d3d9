@@ -18,6 +18,7 @@
 #include <Psapi.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <WinInet.h>
 
 #include <algorithm>
 #include <atomic>
@@ -474,6 +475,7 @@ void LogWinsockSendSignature(const char* apiName) {
     if (g_config.hasDeepHint) {
         fmt::format_to(buf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
     }
+}
 
     fmt::format_to(buf, "\n");
     Log(buf);
