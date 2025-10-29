@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <limits>
+#include <utility>
 
 #include "MinHook.h"
 #include "fmt/format.h"
@@ -82,8 +83,13 @@ struct ProbeConfig {
 ProbeConfig g_config;
 std::atomic<std::uint32_t> g_asqCount{0};
 
-void Log(fmt::memory_buffer& buf);
+void LogString(std::string_view text);
 void LogLine(std::string_view message);
+
+template <typename... Args>
+void LogFormatLine(const char* fmtStr, Args&&... args) {
+    LogLine(fmt::format(fmtStr, std::forward<Args>(args)...));
+}
 
 struct HexString {
     std::string value;
@@ -124,22 +130,22 @@ std::string ToLower(std::string s) {
     return s;
 }
 
-void Log(fmt::memory_buffer& buf) {
-    auto text = fmt::to_string(buf);
-    OutputDebugStringA(text.c_str());
+void LogLine(std::string_view message) {
+    std::string text(message);
+    text.push_back('\n');
+    LogString(text);
 }
 
-void LogLine(std::string_view message) {
-    fmt::memory_buffer buf;
-    fmt::format_to(buf, "{}\n", message);
-    Log(buf);
+void LogString(std::string_view text) {
+    std::string owned(text);
+    OutputDebugStringA(owned.c_str());
 }
 
 std::string ResolveConfigPath() {
     HMODULE module = nullptr;
     if (!GetModuleHandleExA(
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCSTR>(&Log), &module)) {
+        reinterpret_cast<LPCSTR>(&LogLine), &module)) {
         return {};
     }
 
@@ -209,9 +215,7 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
             state.recognized = true;
         }
         else {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Failed to parse asq_sig on line {}\n", lineNumber);
-            Log(buf);
+            LogFormatLine("[OpcodeProbe] Failed to parse asq_sig on line {}", lineNumber);
         }
     }
     else if (state.section == "watch" && lowerKey == "deep_hint") {
@@ -222,20 +226,16 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
             state.recognized = true;
         }
         else {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Failed to parse deep_hint on line {}\n", lineNumber);
-            Log(buf);
+            LogFormatLine("[OpcodeProbe] Failed to parse deep_hint on line {}", lineNumber);
         }
     }
     else {
-        fmt::memory_buffer buf;
         if (!state.section.empty()) {
-            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' in [{}] on line {}\n", key, state.section, lineNumber);
+            LogFormatLine("[OpcodeProbe] Unknown config key '{}' in [{}] on line {}", key, state.section, lineNumber);
         }
         else {
-            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+            LogFormatLine("[OpcodeProbe] Unknown config key '{}' on line {}", key, lineNumber);
         }
-        Log(buf);
     }
 }
 
@@ -248,9 +248,7 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
 
     std::ifstream file(pathOut);
     if (!file.is_open()) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Config file '{}' not found; probe disabled\n", pathOut);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] Config file '{}' not found; probe disabled", pathOut);
         return false;
     }
 
@@ -308,9 +306,7 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
 
         auto equals = line.find('=');
         if (equals == std::string::npos) {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Ignoring config line {} (missing '=')\n", lineNumber);
-            Log(buf);
+            LogFormatLine("[OpcodeProbe] Ignoring config line {} (missing '=')", lineNumber);
             continue;
         }
 
@@ -338,14 +334,10 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
     flushPending(lineNumber);
 
     if (!state.recognized) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Config '{}' contained no recognized settings\n", pathOut);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] Config '{}' contained no recognized settings", pathOut);
     }
     else {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Loaded config from '{}'\n", pathOut);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] Loaded config from '{}'", pathOut);
     }
 
     return state.recognized;
@@ -378,15 +370,13 @@ void LogDiscoverStack(const char* apiName) {
     USHORT captured = CaptureStackBackTrace(0, kMaxFrames, frames, nullptr);
     if (captured == 0) return;
 
-    fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe][discover] {} stack:", apiName);
+    std::string line = fmt::format("[OpcodeProbe][discover] {} stack:", apiName);
     USHORT start = captured > 1 ? 1 : 0;
     for (USHORT i = start; i < captured; ++i) {
         auto desc = DescribeAddress(frames[i]);
-        fmt::format_to(buf, " {}", desc);
+        line += fmt::format(" {}", desc);
     }
-    fmt::format_to(buf, "\n");
-    Log(buf);
+    LogLine(line);
 }
 
 std::string FormatWowFrame(ULONG_PTR rva) {
@@ -461,37 +451,32 @@ void LogWinsockSendSignature(const char* apiName) {
     auto midStr = FormatWowFrame(mid);
     auto deepStr = FormatWowFrame(deep);
 
-    fmt::memory_buffer buf;
-    fmt::format_to(buf,
+    std::string line = fmt::format(
         "[OpcodeProbe][winsock][send] sig=0x{} enc={} mid={} deep={}",
         ToHex(sig, 16).value,
         encStr,
         midStr,
         deepStr);
     if (apiName && apiName[0] != '\0') {
-        fmt::format_to(buf, " api={}", apiName);
+        line += fmt::format(" api={}", apiName);
     }
 
     if (g_config.hasDeepHint) {
-        fmt::format_to(buf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
+        line += fmt::format(" hint=wow+{}", ToHex(g_config.deepHint, 6).value);
     }
 }
 
-    fmt::format_to(buf, "\n");
-    Log(buf);
+    LogLine(line);
 
     if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
         auto count = ++g_asqCount;
         const char* apiLabel = (apiName && apiName[0] != '\0') ? apiName : "?";
 
-        fmt::memory_buffer matchBuf;
-        fmt::format_to(matchBuf,
-            "[ASQ] match #{} mid={} deep={} api={}\n",
+        LogFormatLine("[ASQ] match #{} mid={} deep={} api={}",
             count,
             midStr,
             deepStr,
             apiLabel);
-        Log(matchBuf);
     }
 }
 
@@ -552,30 +537,22 @@ bool InstallHook(const char* moduleName, const char* procName, void* detour, voi
     HMODULE module = GetModuleHandleA(moduleName);
     if (!module) module = LoadLibraryA(moduleName);
     if (!module) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Failed to load {}\n", moduleName);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] Failed to load {}", moduleName);
         return false;
     }
 
     auto target = reinterpret_cast<void*>(GetProcAddress(module, procName));
     if (!target) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] {} not found in {}\n", procName, moduleName);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] {} not found in {}", procName, moduleName);
         return false;
     }
 
     if (MH_CreateHook(target, detour, original) != MH_OK) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] MH_CreateHook failed for {}\n", procName);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] MH_CreateHook failed for {}", procName);
         return false;
     }
     if (MH_EnableHook(target) != MH_OK) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] MH_EnableHook failed for {}\n", procName);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] MH_EnableHook failed for {}", procName);
         return false;
     }
 
@@ -652,9 +629,7 @@ void Configure() {
     }
 
     if (!g_config.phase.empty()) {
-        fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Unknown phase '{}' in '{}'\n", g_config.phase, configPath);
-        Log(buf);
+        LogFormatLine("[OpcodeProbe] Unknown phase '{}' in '{}'", g_config.phase, configPath);
     }
 }
 
