@@ -21,6 +21,7 @@
 #include <WinInet.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -79,6 +80,7 @@ struct ProbeConfig {
 };
 
 ProbeConfig g_config;
+std::atomic<std::uint32_t> g_asqCount{0};
 
 void Log(fmt::memory_buffer& buf);
 void LogLine(std::string_view message);
@@ -473,20 +475,22 @@ void LogWinsockSendSignature(const char* apiName) {
     if (g_config.hasDeepHint) {
         fmt::format_to(buf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
     }
+}
 
     fmt::format_to(buf, "\n");
     Log(buf);
 
     if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
+        auto count = ++g_asqCount;
+        const char* apiLabel = (apiName && apiName[0] != '\0') ? apiName : "?";
+
         fmt::memory_buffer matchBuf;
         fmt::format_to(matchBuf,
-            "[ASQ] Spirit-Healer Query SEND matched (sig=0x{} ) deep={}",
-            ToHex(sig, 16).value,
-            deepStr);
-        if (g_config.hasDeepHint) {
-            fmt::format_to(matchBuf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
-        }
-        fmt::format_to(matchBuf, "\n");
+            "[ASQ] match #{} mid={} deep={} api={}\n",
+            count,
+            midStr,
+            deepStr,
+            apiLabel);
         Log(matchBuf);
     }
 }
@@ -624,6 +628,7 @@ void Configure() {
     }
 
     g_config = ProbeConfig{};
+    g_asqCount.store(0);
     std::string configPath;
     if (!LoadConfigFromFile(g_config, configPath)) {
         return;
