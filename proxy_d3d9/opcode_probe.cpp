@@ -18,6 +18,7 @@
 #include <Psapi.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <WinInet.h>
 
 #include <cctype>
 #include <cstddef>
@@ -37,6 +38,7 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "Wininet.lib")
 #pragma intrinsic(_ReturnAddress)
 
 namespace {
@@ -57,8 +59,14 @@ std::size_t g_wowSize = 0;
 std::uint32_t g_senderRva = 0;
 std::uint32_t g_callerRva = 0;
 
+using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
+Send_t g_origSend = nullptr;
+
 using WSASend_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 WSASend_t g_origWSASend = nullptr;
+
+using WSASendTo_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+WSASendTo_t g_origWSASendTo = nullptr;
 
 using Sender_t = int(__thiscall*)(void*, void*);
 Sender_t g_origSender = nullptr;
@@ -465,14 +473,14 @@ std::string DescribeAddress(void* address) {
     return fmt::format("0x{}", ToHex(addr, 8).value);
 }
 
-void LogDiscoverStack() {
+void LogDiscoverStack(const char* apiName) {
     constexpr USHORT kMaxFrames = 16;
     void* frames[kMaxFrames] = {};
     USHORT captured = CaptureStackBackTrace(0, kMaxFrames, frames, nullptr);
     if (captured == 0) return;
 
     fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe][discover] WSASend stack:");
+    fmt::format_to(buf, "[OpcodeProbe][discover] {} stack:", apiName);
     USHORT start = captured > 1 ? 1 : 0;
     for (USHORT i = start; i < captured; ++i) {
         auto desc = DescribeAddress(frames[i]);
@@ -482,14 +490,61 @@ void LogDiscoverStack() {
     Log(buf);
 }
 
+int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("send");
+    }
+    return g_origSend ? g_origSend(s, buffer, length, flags) : SOCKET_ERROR;
+}
+
 int WSAAPI hkWSASend(
     SOCKET s, LPWSABUF buffers, DWORD bufferCount, LPDWORD bytesSent,
     DWORD flags, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
 {
     if (g_mode == ProbeMode::Discover) {
-        LogDiscoverStack();
+        LogDiscoverStack("WSASend");
     }
     return g_origWSASend ? g_origWSASend(s, buffers, bufferCount, bytesSent, flags, overlapped, completion) : SOCKET_ERROR;
+}
+
+int WSAAPI hkWSASendTo(
+    SOCKET s, LPWSABUF buffers, DWORD bufferCount, LPDWORD bytesSent, DWORD flags,
+    const sockaddr* to, int toLength, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
+{
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("WSASendTo");
+    }
+    return g_origWSASendTo ? g_origWSASendTo(s, buffers, bufferCount, bytesSent, flags, to, toLength, overlapped, completion) : SOCKET_ERROR;
+}
+
+using HttpSendRequestA_t = BOOL(WINAPI*)(HINTERNET, LPCSTR, DWORD, LPVOID, DWORD);
+HttpSendRequestA_t g_origHttpSendRequestA = nullptr;
+
+BOOL WINAPI hkHttpSendRequestA(HINTERNET request, LPCSTR headers, DWORD headerLength, LPVOID optional, DWORD optionalLength) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("HttpSendRequestA");
+    }
+    return g_origHttpSendRequestA ? g_origHttpSendRequestA(request, headers, headerLength, optional, optionalLength) : FALSE;
+}
+
+using HttpSendRequestW_t = BOOL(WINAPI*)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD);
+HttpSendRequestW_t g_origHttpSendRequestW = nullptr;
+
+BOOL WINAPI hkHttpSendRequestW(HINTERNET request, LPCWSTR headers, DWORD headerLength, LPVOID optional, DWORD optionalLength) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("HttpSendRequestW");
+    }
+    return g_origHttpSendRequestW ? g_origHttpSendRequestW(request, headers, headerLength, optional, optionalLength) : FALSE;
+}
+
+using InternetWriteFile_t = BOOL(WINAPI*)(HINTERNET, LPCVOID, DWORD, LPDWORD);
+InternetWriteFile_t g_origInternetWriteFile = nullptr;
+
+BOOL WINAPI hkInternetWriteFile(HINTERNET file, LPCVOID buffer, DWORD numBytesToWrite, LPDWORD numBytesWritten) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("InternetWriteFile");
+    }
+    return g_origInternetWriteFile ? g_origInternetWriteFile(file, buffer, numBytesToWrite, numBytesWritten) : FALSE;
 }
 
 void LogPacket(void* packet, void* caller) {
@@ -625,31 +680,69 @@ int __fastcall hkSender(void* self, void*, void* packet) {
     return g_origSender ? g_origSender(self, packet) : 0;
 }
 
-bool InstallDiscoverHook() {
-    HMODULE ws2 = GetModuleHandleA("Ws2_32.dll");
-    if (!ws2) ws2 = LoadLibraryA("Ws2_32.dll");
-    if (!ws2) {
-        LogLine("[OpcodeProbe] Failed to load Ws2_32.dll");
+bool InstallHook(const char* moduleName, const char* procName, void* detour, void** original) {
+    HMODULE module = GetModuleHandleA(moduleName);
+    if (!module) module = LoadLibraryA(moduleName);
+    if (!module) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] Failed to load {}\n", moduleName);
+        Log(buf);
         return false;
     }
 
-    auto target = reinterpret_cast<LPVOID>(GetProcAddress(ws2, "WSASend"));
+    auto target = reinterpret_cast<void*>(GetProcAddress(module, procName));
     if (!target) {
-        LogLine("[OpcodeProbe] WSASend not found");
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] {} not found in {}\n", procName, moduleName);
+        Log(buf);
         return false;
     }
 
-    if (MH_CreateHook(target, hkWSASend, reinterpret_cast<LPVOID*>(&g_origWSASend)) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_CreateHook failed for WSASend");
+    if (MH_CreateHook(target, detour, original) != MH_OK) {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] MH_CreateHook failed for {}\n", procName);
+        Log(buf);
         return false;
     }
     if (MH_EnableHook(target) != MH_OK) {
-        LogLine("[OpcodeProbe] MH_EnableHook failed for WSASend");
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] MH_EnableHook failed for {}\n", procName);
+        Log(buf);
         return false;
     }
 
-    LogLine("[OpcodeProbe] Discover mode active (WSASend)");
     return true;
+}
+
+bool InstallDiscoverHook() {
+    bool anyHooked = false;
+    if (InstallHook("Ws2_32.dll", "send", reinterpret_cast<void*>(hkSend), reinterpret_cast<void**>(&g_origSend))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "WSASend", reinterpret_cast<void*>(hkWSASend), reinterpret_cast<void**>(&g_origWSASend))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "WSASendTo", reinterpret_cast<void*>(hkWSASendTo), reinterpret_cast<void**>(&g_origWSASendTo))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Wininet.dll", "HttpSendRequestA", reinterpret_cast<void*>(hkHttpSendRequestA), reinterpret_cast<void**>(&g_origHttpSendRequestA))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Wininet.dll", "HttpSendRequestW", reinterpret_cast<void*>(hkHttpSendRequestW), reinterpret_cast<void**>(&g_origHttpSendRequestW))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Wininet.dll", "InternetWriteFile", reinterpret_cast<void*>(hkInternetWriteFile), reinterpret_cast<void**>(&g_origInternetWriteFile))) {
+        anyHooked = true;
+    }
+
+    if (anyHooked) {
+        LogLine("[OpcodeProbe] Discover mode active (network API hooks)");
+    }
+    else {
+        LogLine("[OpcodeProbe] Discover mode failed to install hooks");
+    }
+
+    return anyHooked;
 }
 
 bool InstallSenderHook() {
