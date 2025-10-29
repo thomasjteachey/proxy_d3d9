@@ -30,7 +30,6 @@ static HRESULT STDMETHODCALLTYPE hkCreateDevice(IDirect3D9* self, UINT a, D3DDEV
     return hr;
 }
 
-        OpcodeProbe_Init();
 // IDirect3D9Ex::CreateDeviceEx (index differs; we’ll hook both)
 using CreateDeviceEx_t = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
 static CreateDeviceEx_t oCreateDeviceEx = nullptr;
@@ -54,6 +53,7 @@ void InitHooksOnce()
         CallSplit_Init();   // <-- add this
         NetTrace::Init();
         NetSplit_Init();
+        OpcodeProbe_Init();
         // Pattern-scan & attach combat hooks (safe if patterns not set—they’ll just no-op).
         InstallCombatHooks();
         OutputDebugStringA("[ClientFix] InitHooksOnce()\n");
