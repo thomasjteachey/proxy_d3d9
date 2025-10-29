@@ -18,6 +18,7 @@
 #include <Psapi.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <WinInet.h>
 
 #include <algorithm>
 #include <cctype>
@@ -52,6 +53,9 @@ ProbeMode g_mode = ProbeMode::Off;
 HMODULE g_wowModule = nullptr;
 std::uintptr_t g_wowBase = 0;
 std::size_t g_wowSize = 0;
+using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
+Send_t g_origSend = nullptr;
+
 using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
 Send_t g_origSend = nullptr;
 
