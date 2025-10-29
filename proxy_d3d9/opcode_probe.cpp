@@ -31,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <limits>
 
 #include "MinHook.h"
 #include "fmt/format.h"
@@ -46,7 +47,11 @@ enum class ProbeMode {
     Winsock,
 };
 
-constexpr unsigned kSpiritHealerOpcode = 0x02E2;
+extern "C" USHORT NTAPI RtlCaptureStackBackTrace(
+    ULONG FramesToSkip,
+    ULONG FramesToCapture,
+    PVOID* BackTrace,
+    PULONG BackTraceHash);
 
 std::once_flag g_initOnce;
 ProbeMode g_mode = ProbeMode::Off;
@@ -67,7 +72,13 @@ WSARecv_t g_origWinsockWSARecv = nullptr;
 
 struct ProbeConfig {
     std::string phase;
+    std::uint64_t asqSignature = 0;
+    bool hasAsqSignature = false;
+    std::uint32_t deepHint = 0;
+    bool hasDeepHint = false;
 };
+
+ProbeConfig g_config;
 
 void Log(fmt::memory_buffer& buf);
 void LogLine(std::string_view message);
@@ -151,7 +162,31 @@ std::string ResolveConfigPath() {
 struct ConfigState {
     ProbeConfig* config = nullptr;
     bool recognized = false;
+    std::string section;
 };
+
+bool ParseUint64(const std::string& text, std::uint64_t& value) {
+    const char* str = text.c_str();
+    char* end = nullptr;
+    unsigned long long parsed = _strtoui64(str, &end, 0);
+    if (!str || end == str || (end && *end != '\0')) {
+        return false;
+    }
+    value = static_cast<std::uint64_t>(parsed);
+    return true;
+}
+
+bool ParseUint32(const std::string& text, std::uint32_t& value) {
+    std::uint64_t temp = 0;
+    if (!ParseUint64(text, temp)) {
+        return false;
+    }
+    if (temp > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    value = static_cast<std::uint32_t>(temp);
+    return true;
+}
 
 void ApplyConfigValue(ConfigState& state, const std::string& key, const std::string& value, std::size_t lineNumber) {
     if (!state.config) {
@@ -160,13 +195,44 @@ void ApplyConfigValue(ConfigState& state, const std::string& key, const std::str
 
     auto lowerKey = ToLower(key);
 
-    if (lowerKey == "phase") {
+    if ((state.section.empty() || state.section == "probe") && lowerKey == "phase") {
         state.config->phase = value;
         state.recognized = true;
     }
+    else if (state.section == "watch" && lowerKey == "asq_sig") {
+        std::uint64_t parsed = 0;
+        if (ParseUint64(value, parsed)) {
+            state.config->asqSignature = parsed;
+            state.config->hasAsqSignature = true;
+            state.recognized = true;
+        }
+        else {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Failed to parse asq_sig on line {}\n", lineNumber);
+            Log(buf);
+        }
+    }
+    else if (state.section == "watch" && lowerKey == "deep_hint") {
+        std::uint32_t parsed = 0;
+        if (ParseUint32(value, parsed)) {
+            state.config->deepHint = parsed;
+            state.config->hasDeepHint = true;
+            state.recognized = true;
+        }
+        else {
+            fmt::memory_buffer buf;
+            fmt::format_to(buf, "[OpcodeProbe] Failed to parse deep_hint on line {}\n", lineNumber);
+            Log(buf);
+        }
+    }
     else {
         fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+        if (!state.section.empty()) {
+            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' in [{}] on line {}\n", key, state.section, lineNumber);
+        }
+        else {
+            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+        }
         Log(buf);
     }
 }
@@ -210,6 +276,14 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
 
         Trim(line);
         if (line.empty()) {
+            continue;
+        }
+
+        if (!line.empty() && line.front() == '[' && line.back() == ']') {
+            flushPending(lineNumber);
+            std::string section = line.substr(1, line.size() - 2);
+            Trim(section);
+            state.section = ToLower(section);
             continue;
         }
 
@@ -313,104 +387,106 @@ void LogDiscoverStack(const char* apiName) {
     Log(buf);
 }
 
-struct PacketHeader {
-    std::uint16_t size = 0;
-    std::uint16_t opcode = 0;
-};
-
-bool ExtractHeaderFromSpan(const std::uint8_t* data, std::size_t length, PacketHeader& header) {
-    if (!data || length < 4) {
-        return false;
+std::string FormatWowFrame(ULONG_PTR rva) {
+    if (rva == 0) {
+        return "wow+??????";
     }
-
-    header.size = static_cast<std::uint16_t>(data[0] | (static_cast<std::uint16_t>(data[1]) << 8));
-    header.opcode = static_cast<std::uint16_t>(data[2] | (static_cast<std::uint16_t>(data[3]) << 8));
-    return true;
+    return fmt::format("wow+{}", ToHex(rva, 6).value);
 }
 
-bool ExtractHeaderFromBuffers(LPWSABUF buffers, DWORD bufferCount, std::size_t availableBytes, PacketHeader& header) {
-    if (!buffers || bufferCount == 0 || availableBytes < 4) {
-        return false;
-    }
-
-    std::uint8_t headerBytes[4] = {};
-    std::size_t copied = 0;
-
-    for (DWORD i = 0; i < bufferCount && copied < 4 && availableBytes > 0; ++i) {
-        const WSABUF& buf = buffers[i];
-        if (!buf.buf || buf.len == 0) {
-            continue;
-        }
-
-        std::size_t bufferLen = static_cast<std::size_t>(buf.len);
-        if (bufferLen == 0) {
-            continue;
-        }
-
-        std::size_t allowed = std::min(bufferLen, availableBytes);
-        if (allowed == 0) {
-            continue;
-        }
-
-        std::size_t toCopy = std::min<std::size_t>(allowed, 4 - copied);
-        std::memcpy(headerBytes + copied, buf.buf, toCopy);
-        copied += toCopy;
-        availableBytes -= toCopy;
-    }
-
-    if (copied < 4) {
-        return false;
-    }
-
-    return ExtractHeaderFromSpan(headerBytes, sizeof(headerBytes), header);
-}
-
-std::uint32_t CaptureWowCallerRva() {
+ULONG_PTR WowFrameRva(std::size_t n_wow_frame) {
     if (!g_wowBase || !g_wowSize) {
         return 0;
     }
 
-    constexpr USHORT kMaxFrames = 32;
-    void* frames[kMaxFrames] = {};
-    USHORT captured = CaptureStackBackTrace(0, kMaxFrames, frames, nullptr);
+    void* frames[64] = {};
+    constexpr ULONG frameCount = static_cast<ULONG>(sizeof(frames) / sizeof(frames[0]));
+    USHORT captured = RtlCaptureStackBackTrace(0, frameCount, frames, nullptr);
     if (captured == 0) {
         return 0;
     }
 
+    const std::uintptr_t lo = g_wowBase;
+    const std::uintptr_t hi = g_wowBase + g_wowSize;
+    std::size_t seen = 0;
     for (USHORT i = 0; i < captured; ++i) {
         auto addr = reinterpret_cast<std::uintptr_t>(frames[i]);
-        if (addr >= g_wowBase && addr < (g_wowBase + g_wowSize)) {
-            return static_cast<std::uint32_t>(addr - g_wowBase);
+        if (addr >= lo && addr < hi) {
+            if (seen == n_wow_frame) {
+                return static_cast<ULONG_PTR>(addr - lo);
+            }
+            ++seen;
         }
     }
 
     return 0;
 }
 
-void LogWinsockPacket(const char* direction, const char* apiName, const PacketHeader& header, std::uint32_t callerRva) {
+std::uint64_t StackSig() {
+    if (!g_wowBase || !g_wowSize) {
+        return 0;
+    }
+
+    void* frames[32] = {};
+    constexpr ULONG frameCount = static_cast<ULONG>(sizeof(frames) / sizeof(frames[0]));
+    USHORT captured = RtlCaptureStackBackTrace(0, frameCount, frames, nullptr);
+    if (captured == 0) {
+        return 0;
+    }
+
+    const std::uintptr_t lo = g_wowBase;
+    const std::uintptr_t hi = g_wowBase + g_wowSize;
+
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (USHORT i = 0; i < captured; ++i) {
+        auto addr = reinterpret_cast<std::uintptr_t>(frames[i]);
+        if (addr >= lo && addr < hi) {
+            std::uint32_t rva = static_cast<std::uint32_t>(addr - lo);
+            hash ^= rva;
+            hash *= 0x100000001B3ULL;
+        }
+    }
+
+    return hash;
+}
+
+void LogWinsockSendSignature(const char* apiName) {
+    auto sig = StackSig();
+    auto enc = WowFrameRva(0);
+    auto mid = WowFrameRva(4);
+    auto deep = WowFrameRva(8);
+    auto encStr = FormatWowFrame(enc);
+    auto midStr = FormatWowFrame(mid);
+    auto deepStr = FormatWowFrame(deep);
+
     fmt::memory_buffer buf;
-    fmt::format_to(buf, "[OpcodeProbe][winsock][{}] opcode=0x{} size={}",
-        direction,
-        ToHex(header.opcode, 4).value,
-        header.size);
+    fmt::format_to(buf,
+        "[OpcodeProbe][winsock][send] sig=0x{} enc={} mid={} deep={} api={}",
+        ToHex(sig, 16).value,
+        encStr,
+        midStr,
+        deepStr,
+        apiName ? apiName : "?");
 
-    if (callerRva) {
-        fmt::format_to(buf, " caller=wow+0x{}", ToHex(callerRva, 6).value);
-    }
-    else {
-        fmt::format_to(buf, " caller=?");
-    }
-
-    if (apiName && *apiName) {
-        fmt::format_to(buf, " api={}", apiName);
-    }
-
-    if (header.opcode == kSpiritHealerOpcode) {
-        fmt::format_to(buf, " <<< CMSG_AREA_SPIRIT_HEALER_QUERY");
+    if (g_config.hasDeepHint) {
+        fmt::format_to(buf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
     }
 
     fmt::format_to(buf, "\n");
     Log(buf);
+
+    if (g_config.hasAsqSignature && sig == g_config.asqSignature) {
+        fmt::memory_buffer matchBuf;
+        fmt::format_to(matchBuf,
+            "[ASQ] Spirit-Healer Query SEND matched (sig=0x{} deep={}",
+            ToHex(sig, 16).value,
+            deepStr);
+        if (g_config.hasDeepHint) {
+            fmt::format_to(matchBuf, " hint=wow+{}", ToHex(g_config.deepHint, 6).value);
+        }
+        fmt::format_to(matchBuf, ")\n");
+        Log(matchBuf);
+    }
 }
 
 int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
@@ -418,12 +494,7 @@ int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
         LogDiscoverStack("send");
     }
     else if (g_mode == ProbeMode::Winsock && buffer && length > 0) {
-        PacketHeader header;
-        std::size_t available = static_cast<std::size_t>(length);
-        if (ExtractHeaderFromSpan(reinterpret_cast<const std::uint8_t*>(buffer), available, header)) {
-            auto callerRva = CaptureWowCallerRva();
-            LogWinsockPacket("send", "send", header, callerRva);
-        }
+        LogWinsockSendSignature("send");
     }
 
     return g_origWinsockSend ? g_origWinsockSend(s, buffer, length, flags) : SOCKET_ERROR;
@@ -437,22 +508,15 @@ int WSAAPI hkWSASend(
         LogDiscoverStack("WSASend");
     }
     else if (g_mode == ProbeMode::Winsock && buffers && bufferCount > 0) {
-        std::size_t available = 0;
-        for (DWORD i = 0; i < bufferCount && available < 4; ++i) {
-            std::size_t len = static_cast<std::size_t>(buffers[i].len);
-            if (len == 0) {
-                continue;
+        bool hasData = false;
+        for (DWORD i = 0; i < bufferCount; ++i) {
+            if (buffers[i].buf && buffers[i].len > 0) {
+                hasData = true;
+                break;
             }
-            std::size_t toAdd = std::min<std::size_t>(len, 4 - available);
-            available += toAdd;
         }
-
-        if (available >= 4) {
-            PacketHeader header;
-            if (ExtractHeaderFromBuffers(buffers, bufferCount, available, header)) {
-                auto callerRva = CaptureWowCallerRva();
-                LogWinsockPacket("send", "WSASend", header, callerRva);
-            }
+        if (hasData) {
+            LogWinsockSendSignature("WSASend");
         }
     }
 
@@ -464,17 +528,7 @@ int WSAAPI hkRecv(SOCKET s, char* buffer, int length, int flags) {
         LogDiscoverStack("recv");
     }
 
-    int result = g_origWinsockRecv ? g_origWinsockRecv(s, buffer, length, flags) : SOCKET_ERROR;
-
-    if (g_mode == ProbeMode::Winsock && result > 0 && buffer) {
-        PacketHeader header;
-        if (ExtractHeaderFromSpan(reinterpret_cast<const std::uint8_t*>(buffer), static_cast<std::size_t>(result), header)) {
-            auto callerRva = CaptureWowCallerRva();
-            LogWinsockPacket("recv", "recv", header, callerRva);
-        }
-    }
-
-    return result;
+    return g_origWinsockRecv ? g_origWinsockRecv(s, buffer, length, flags) : SOCKET_ERROR;
 }
 
 int WSAAPI hkWSARecv(
@@ -485,17 +539,7 @@ int WSAAPI hkWSARecv(
         LogDiscoverStack("WSARecv");
     }
 
-    int result = g_origWinsockWSARecv ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
-
-    if (g_mode == ProbeMode::Winsock && result == 0 && buffers && bufferCount > 0 && bytesRecvd && *bytesRecvd >= 4 && !overlapped) {
-        PacketHeader header;
-        if (ExtractHeaderFromBuffers(buffers, bufferCount, static_cast<std::size_t>(*bytesRecvd), header)) {
-            auto callerRva = CaptureWowCallerRva();
-            LogWinsockPacket("recv", "WSARecv", header, callerRva);
-        }
-    }
-
-    return result;
+    return g_origWinsockWSARecv ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
 }
 
 bool InstallHook(const char* moduleName, const char* procName, void* detour, void** original) {
@@ -577,13 +621,13 @@ void Configure() {
         return;
     }
 
-    ProbeConfig config;
+    g_config = ProbeConfig{};
     std::string configPath;
-    if (!LoadConfigFromFile(config, configPath)) {
+    if (!LoadConfigFromFile(g_config, configPath)) {
         return;
     }
 
-    std::string lower = ToLower(config.phase);
+    std::string lower = ToLower(g_config.phase);
     if (lower == "discover") {
         g_mode = ProbeMode::Discover;
         if (InstallWinsockHooks()) {
@@ -595,14 +639,14 @@ void Configure() {
     if (lower.empty() || lower == "winsock") {
         g_mode = ProbeMode::Winsock;
         if (InstallWinsockHooks()) {
-            LogLine("[OpcodeProbe] Winsock opcode logging active");
+            LogLine("[OpcodeProbe] Winsock stack signature logging active");
         }
         return;
     }
 
-    if (!config.phase.empty()) {
+    if (!g_config.phase.empty()) {
         fmt::memory_buffer buf;
-        fmt::format_to(buf, "[OpcodeProbe] Unknown phase '{}' in '{}'\n", config.phase, configPath);
+        fmt::format_to(buf, "[OpcodeProbe] Unknown phase '{}' in '{}'\n", g_config.phase, configPath);
         Log(buf);
     }
 }
