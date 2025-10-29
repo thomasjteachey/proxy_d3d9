@@ -305,6 +305,41 @@ std::string ResolveConfigPath() {
     return fullPath;
 }
 
+struct ConfigState {
+    ProbeConfig* config = nullptr;
+    bool recognized = false;
+};
+
+void ApplyConfigValue(ConfigState& state, const std::string& key, const std::string& value, std::size_t lineNumber) {
+    if (!state.config) {
+        return;
+    }
+
+    auto lowerKey = ToLower(key);
+
+    if (lowerKey == "phase") {
+        state.config->phase = value;
+        state.recognized = true;
+    }
+    else if (lowerKey == "sender_rva") {
+        state.config->senderRva = value;
+        state.recognized = true;
+    }
+    else if (lowerKey == "caller_rva") {
+        state.config->callerRva = value;
+        state.recognized = true;
+    }
+    else if (lowerKey == "caller_flags") {
+        state.config->callerFlags = value;
+        state.recognized = true;
+    }
+    else {
+        fmt::memory_buffer buf;
+        fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
+        Log(buf);
+    }
+}
+
 bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
     pathOut = ResolveConfigPath();
     if (pathOut.empty()) {
@@ -320,7 +355,19 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
         return false;
     }
 
-    bool recognized = false;
+    ConfigState state{ &config, false };
+    std::string pendingKey;
+    std::string pendingValue;
+    auto flushPending = [&](std::size_t lineNumber) {
+        if (pendingKey.empty()) {
+            return;
+        }
+        Trim(pendingValue);
+        ApplyConfigValue(state, pendingKey, pendingValue, lineNumber);
+        pendingKey.clear();
+        pendingValue.clear();
+    };
+
     std::string line;
     std::size_t lineNumber = 0;
     while (std::getline(file, line)) {
@@ -332,6 +379,23 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
 
         Trim(line);
         if (line.empty()) {
+            continue;
+        }
+
+        if (!pendingKey.empty()) {
+            bool continued = false;
+            if (!line.empty() && line.back() == '\\') {
+                continued = true;
+                line.pop_back();
+                Trim(line);
+            }
+            if (!line.empty()) {
+                if (!pendingValue.empty()) pendingValue.append(" ");
+                pendingValue.append(line);
+            }
+            if (!continued) {
+                flushPending(lineNumber);
+            }
             continue;
         }
 
@@ -347,32 +411,26 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
         std::string value = line.substr(equals + 1);
         Trim(key);
         Trim(value);
-        auto lowerKey = ToLower(key);
 
-        if (lowerKey == "phase") {
-            config.phase = value;
-            recognized = true;
+        bool continued = false;
+        if (!value.empty() && value.back() == '\\') {
+            continued = true;
+            value.pop_back();
+            Trim(value);
         }
-        else if (lowerKey == "sender_rva") {
-            config.senderRva = value;
-            recognized = true;
+
+        if (continued) {
+            pendingKey = key;
+            pendingValue = value;
+            continue;
         }
-        else if (lowerKey == "caller_rva") {
-            config.callerRva = value;
-            recognized = true;
-        }
-        else if (lowerKey == "caller_flags") {
-            config.callerFlags = value;
-            recognized = true;
-        }
-        else {
-            fmt::memory_buffer buf;
-            fmt::format_to(buf, "[OpcodeProbe] Unknown config key '{}' on line {}\n", key, lineNumber);
-            Log(buf);
-        }
+
+        ApplyConfigValue(state, key, value, lineNumber);
     }
 
-    if (!recognized) {
+    flushPending(lineNumber);
+
+    if (!state.recognized) {
         fmt::memory_buffer buf;
         fmt::format_to(buf, "[OpcodeProbe] Config '{}' contained no recognized settings\n", pathOut);
         Log(buf);
@@ -383,7 +441,7 @@ bool LoadConfigFromFile(ProbeConfig& config, std::string& pathOut) {
         Log(buf);
     }
 
-    return recognized;
+    return state.recognized;
 }
 
 std::string DescribeAddress(void* address) {
