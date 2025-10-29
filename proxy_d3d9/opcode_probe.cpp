@@ -59,8 +59,14 @@ std::size_t g_wowSize = 0;
 std::uint32_t g_senderRva = 0;
 std::uint32_t g_callerRva = 0;
 
+using Send_t = int (WSAAPI*)(SOCKET, const char*, int, int);
+Send_t g_origSend = nullptr;
+
 using WSASend_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
 WSASend_t g_origWSASend = nullptr;
+
+using WSASendTo_t = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const sockaddr*, int, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+WSASendTo_t g_origWSASendTo = nullptr;
 
 using Sender_t = int(__thiscall*)(void*, void*);
 Sender_t g_origSender = nullptr;
@@ -484,6 +490,13 @@ void LogDiscoverStack(const char* apiName) {
     Log(buf);
 }
 
+int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("send");
+    }
+    return g_origSend ? g_origSend(s, buffer, length, flags) : SOCKET_ERROR;
+}
+
 int WSAAPI hkWSASend(
     SOCKET s, LPWSABUF buffers, DWORD bufferCount, LPDWORD bytesSent,
     DWORD flags, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
@@ -492,6 +505,16 @@ int WSAAPI hkWSASend(
         LogDiscoverStack("WSASend");
     }
     return g_origWSASend ? g_origWSASend(s, buffers, bufferCount, bytesSent, flags, overlapped, completion) : SOCKET_ERROR;
+}
+
+int WSAAPI hkWSASendTo(
+    SOCKET s, LPWSABUF buffers, DWORD bufferCount, LPDWORD bytesSent, DWORD flags,
+    const sockaddr* to, int toLength, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
+{
+    if (g_mode == ProbeMode::Discover) {
+        LogDiscoverStack("WSASendTo");
+    }
+    return g_origWSASendTo ? g_origWSASendTo(s, buffers, bufferCount, bytesSent, flags, to, toLength, overlapped, completion) : SOCKET_ERROR;
 }
 
 using HttpSendRequestA_t = BOOL(WINAPI*)(HINTERNET, LPCSTR, DWORD, LPVOID, DWORD);
@@ -693,7 +716,13 @@ bool InstallHook(const char* moduleName, const char* procName, void* detour, voi
 
 bool InstallDiscoverHook() {
     bool anyHooked = false;
+    if (InstallHook("Ws2_32.dll", "send", reinterpret_cast<void*>(hkSend), reinterpret_cast<void**>(&g_origSend))) {
+        anyHooked = true;
+    }
     if (InstallHook("Ws2_32.dll", "WSASend", reinterpret_cast<void*>(hkWSASend), reinterpret_cast<void**>(&g_origWSASend))) {
+        anyHooked = true;
+    }
+    if (InstallHook("Ws2_32.dll", "WSASendTo", reinterpret_cast<void*>(hkWSASendTo), reinterpret_cast<void**>(&g_origWSASendTo))) {
         anyHooked = true;
     }
     if (InstallHook("Wininet.dll", "HttpSendRequestA", reinterpret_cast<void*>(hkHttpSendRequestA), reinterpret_cast<void**>(&g_origHttpSendRequestA))) {
