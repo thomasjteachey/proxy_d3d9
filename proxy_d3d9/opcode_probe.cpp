@@ -35,6 +35,7 @@
 #include <limits>
 #include <utility>
 #include <chrono>
+#include <vector>
 
 #include "MinHook.h"
 #include "fmt/format.h"
@@ -85,11 +86,11 @@ namespace {
         bool hasAsqSignature = false;
         std::uint32_t deepHint = 0;
         bool hasDeepHint = false;
-        std::string worldHost;
-        bool hasWorldHost = false;
-        in_addr worldAddr{};
-        std::uint16_t worldPort = 0;
-        bool hasWorldPort = false;
+        std::vector<std::string> worldHosts;
+        std::vector<in_addr> worldAddrs;
+        bool hasWorldHosts = false;
+        std::vector<std::uint16_t> worldPorts;
+        bool hasWorldPorts = false;
         std::uint32_t maxPacketBytes = 48;
         bool hasMaxPacketBytes = false;
         std::uint32_t debounceMs = 200;
@@ -233,6 +234,29 @@ namespace {
         return true;
     }
 
+    std::vector<std::string> SplitCsv(const std::string& text) {
+        std::vector<std::string> values;
+        std::size_t start = 0;
+        while (start <= text.size()) {
+            auto comma = text.find(',', start);
+            std::string token;
+            if (comma == std::string::npos) {
+                token = text.substr(start);
+                start = text.size() + 1;
+            }
+            else {
+                token = text.substr(start, comma - start);
+                start = comma + 1;
+            }
+
+            Trim(token);
+            if (!token.empty()) {
+                values.emplace_back(std::move(token));
+            }
+        }
+        return values;
+    }
+
     void ApplyConfigValue(ConfigState& state, const std::string& key, const std::string& value, std::size_t lineNumber) {
         if (!state.config) {
             return;
@@ -267,27 +291,49 @@ namespace {
             }
         }
         else if (state.section == "winsock" && lowerKey == "world_host") {
-            in_addr addr{};
-            if (InetPtonA(AF_INET, value.c_str(), &addr) == 1) {
-                state.config->worldAddr = addr;
-                state.config->worldHost = value;
-                state.config->hasWorldHost = true;
-                state.recognized = true;
-            }
-            else {
+            auto entries = SplitCsv(value);
+            if (entries.empty()) {
                 ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_host on line {}", lineNumber);
+                return;
             }
+
+            std::vector<in_addr> addrs;
+            addrs.reserve(entries.size());
+            for (const auto& entry : entries) {
+                in_addr addr{};
+                if (InetPtonA(AF_INET, entry.c_str(), &addr) != 1) {
+                    ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_host '{}' on line {}", entry, lineNumber);
+                    return;
+                }
+                addrs.push_back(addr);
+            }
+
+            state.config->worldHosts = std::move(entries);
+            state.config->worldAddrs = std::move(addrs);
+            state.config->hasWorldHosts = true;
+            state.recognized = true;
         }
         else if (state.section == "winsock" && lowerKey == "world_port") {
-            std::uint16_t parsed = 0;
-            if (ParseUint16(value, parsed)) {
-                state.config->worldPort = parsed;
-                state.config->hasWorldPort = true;
-                state.recognized = true;
-            }
-            else {
+            auto entries = SplitCsv(value);
+            if (entries.empty()) {
                 ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_port on line {}", lineNumber);
+                return;
             }
+
+            std::vector<std::uint16_t> ports;
+            ports.reserve(entries.size());
+            for (const auto& entry : entries) {
+                std::uint16_t parsed = 0;
+                if (!ParseUint16(entry, parsed)) {
+                    ProbeLogFormatLine("[OpcodeProbe] Failed to parse world_port '{}' on line {}", entry, lineNumber);
+                    return;
+                }
+                ports.push_back(parsed);
+            }
+
+            state.config->worldPorts = std::move(ports);
+            state.config->hasWorldPorts = true;
+            state.recognized = true;
         }
         else if ((state.section == "winsock" || state.section == "filter") && lowerKey == "max_packet_bytes") {
             std::uint32_t parsed = 0;
@@ -662,26 +708,48 @@ int WSAAPI hkWSARecv(
             return;
         }
 
-        if (!g_config.hasWorldPort) {
+        if (!g_config.hasWorldPorts) {
             return;
         }
 
         if (name->sa_family == AF_INET && nameLen >= static_cast<int>(sizeof(sockaddr_in))) {
             const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(name);
             std::uint16_t port = ntohs(ipv4->sin_port);
-            if (port != g_config.worldPort) {
+            bool portMatch = false;
+            for (auto configuredPort : g_config.worldPorts) {
+                if (port == configuredPort) {
+                    portMatch = true;
+                    break;
+                }
+            }
+            if (!portMatch) {
                 return;
             }
 
-            if (g_config.hasWorldHost) {
-                if (ipv4->sin_addr.S_un.S_addr != g_config.worldAddr.S_un.S_addr) {
+            if (g_config.hasWorldHosts) {
+                bool hostMatch = false;
+                for (const auto& configuredAddr : g_config.worldAddrs) {
+                    if (ipv4->sin_addr.S_un.S_addr == configuredAddr.S_un.S_addr) {
+                        hostMatch = true;
+                        break;
+                    }
+                }
+                if (!hostMatch) {
                     return;
                 }
             }
 
             g_trackedSocket.store(socket);
             auto socketValue = static_cast<std::uintptr_t>(socket);
-            ProbeLogFormatLine("[OpcodeProbe] Tracking world socket {}:{} (socket=0x{})", g_config.hasWorldHost ? g_config.worldHost : "*", g_config.worldPort, ToHex(socketValue, static_cast<int>(sizeof(SOCKET) * 2)).value);
+            std::string hostDesc = "*";
+            if (g_config.hasWorldHosts) {
+                hostDesc = fmt::format("{}", fmt::join(g_config.worldHosts.begin(), g_config.worldHosts.end(), ","));
+            }
+            std::string portDesc = "*";
+            if (g_config.hasWorldPorts) {
+                portDesc = fmt::format("{}", fmt::join(g_config.worldPorts.begin(), g_config.worldPorts.end(), ","));
+            }
+            ProbeLogFormatLine("[OpcodeProbe] Tracking world socket {}:{} (socket=0x{})", hostDesc, portDesc, ToHex(socketValue, static_cast<int>(sizeof(SOCKET) * 2)).value);
         }
     }
 
