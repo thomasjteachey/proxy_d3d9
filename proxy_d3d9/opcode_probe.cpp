@@ -39,6 +39,7 @@
 
 #include "MinHook.h"
 #include "fmt/format.h"
+#include "timing.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Psapi.lib")
@@ -105,6 +106,20 @@ namespace {
     std::atomic<std::uint32_t> g_asqCount{ 0 };
     std::atomic<int> g_dropRemaining{ 0 };
     std::atomic<SOCKET> g_trackedSocket{ INVALID_SOCKET };
+
+    struct RecvEvent {
+        std::uint64_t sig;
+        std::uint32_t mid;
+        std::uint32_t deep;
+        std::uint32_t len;
+        std::uint32_t t_ms;
+    };
+
+    static std::vector<RecvEvent> g_recvRing;
+    static std::atomic<std::uint32_t> g_recvIdx{ 0 };
+
+    static std::uint32_t g_corrPreMs = 400;
+    static std::uint32_t g_corrRingCap = 128;
     std::mutex g_dedupeMutex;
     std::string g_lastLogLine;
     std::chrono::steady_clock::time_point g_lastLogTime;
@@ -159,6 +174,10 @@ namespace {
     std::string ToLower(std::string s) {
         for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return s;
+    }
+
+    std::uint32_t NowMs() {
+        return static_cast<std::uint32_t>(NowSecondsMonotonic() * 1000.0);
     }
 
     void ProbeLogLine(std::string_view message) {
@@ -404,6 +423,26 @@ namespace {
             }
             else {
                 ProbeLogFormatLine("[OpcodeProbe] Failed to parse drop_count on line {}", lineNumber);
+            }
+        }
+        else if (state.section == "corr" && lowerKey == "pre_ms") {
+            std::uint32_t parsed = 0;
+            if (ParseUint32(value, parsed)) {
+                g_corrPreMs = parsed;
+                state.recognized = true;
+            }
+            else {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse pre_ms on line {}", lineNumber);
+            }
+        }
+        else if (state.section == "corr" && lowerKey == "max_events") {
+            std::uint32_t parsed = 0;
+            if (ParseUint32(value, parsed)) {
+                g_corrRingCap = std::max<std::uint32_t>(32, parsed);
+                state.recognized = true;
+            }
+            else {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse max_events on line {}", lineNumber);
             }
         }
         else {
@@ -678,6 +717,57 @@ namespace {
         return false;
     }
 
+    void RecordRecvEvent(SOCKET s, std::size_t totalLength) {
+        if (g_recvRing.empty()) {
+            return;
+        }
+        if (!ShouldLogPacket(s, totalLength)) {
+            return;
+        }
+
+        RecvEvent ev{};
+        ev.sig = StackSig();
+        ev.mid = static_cast<std::uint32_t>(WowFrameRva(4));
+        ev.deep = static_cast<std::uint32_t>(WowFrameRva(8));
+        ev.len = static_cast<std::uint32_t>(totalLength);
+        ev.t_ms = NowMs();
+
+        std::uint32_t i = g_recvIdx.fetch_add(1, std::memory_order_relaxed);
+        if (!g_recvRing.empty()) {
+            g_recvRing[i % g_recvRing.size()] = ev;
+        }
+    }
+
+    void DumpRecvContext(std::uint32_t pre_ms) {
+        if (g_recvRing.empty()) {
+            return;
+        }
+
+        const std::uint32_t now = NowMs();
+        const std::uint32_t cap = static_cast<std::uint32_t>(g_recvRing.size());
+        const std::uint32_t head = g_recvIdx.load(std::memory_order_relaxed);
+
+        for (std::uint32_t n = 0; n < cap; ++n) {
+            std::uint32_t idx = (head - 1 - n) % cap;
+            const RecvEvent& e = g_recvRing[idx];
+            if (e.t_ms == 0) {
+                break;
+            }
+            std::uint32_t age = now - e.t_ms;
+            if (age > pre_ms) {
+                break;
+            }
+
+            ProbeLogFormatLine(
+                "[ASQ][ctx] -{}ms recv sig=0x{} mid=wow+{} deep=wow+{} len={}",
+                static_cast<int>(age),
+                ToHex(e.sig, 16).value,
+                ToHex(e.mid, 6).value,
+                ToHex(e.deep, 6).value,
+                e.len);
+        }
+    }
+
     void LogWinsockSendSignature(const char* apiName) {
         auto sig = StackSig();
         auto enc = WowFrameRva(0);
@@ -711,13 +801,15 @@ namespace {
             auto count = ++g_asqCount;
             const char* apiLabel = (apiName && apiName[0] != '\0') ? apiName : "?";
 
-        ProbeLogFormatLine("[ASQ] match #{} mid={} deep={} api={}",
-            count,
-            midStr,
-            deepStr,
-            apiLabel);
+            ProbeLogFormatLine(
+                "[ASQ] match #{} mid={} deep={} api={}",
+                count,
+                midStr,
+                deepStr,
+                apiLabel);
+            DumpRecvContext(g_corrPreMs);
+        }
     }
-}
 
 int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
     if (g_mode == ProbeMode::Discover) {
@@ -791,7 +883,11 @@ int WSAAPI hkRecv(SOCKET s, char* buffer, int length, int flags) {
         LogDiscoverStack("recv");
     }
 
-    return g_origWinsockRecv ? g_origWinsockRecv(s, buffer, length, flags) : SOCKET_ERROR;
+    int result = g_origWinsockRecv ? g_origWinsockRecv(s, buffer, length, flags) : SOCKET_ERROR;
+    if (g_mode == ProbeMode::Winsock && result > 0) {
+        RecordRecvEvent(s, static_cast<std::size_t>(result));
+    }
+    return result;
 }
 
 int WSAAPI hkWSARecv(
@@ -802,7 +898,16 @@ int WSAAPI hkWSARecv(
         LogDiscoverStack("WSARecv");
     }
 
-    return g_origWinsockWSARecv ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion) : SOCKET_ERROR;
+    int result = g_origWinsockWSARecv
+        ? g_origWinsockWSARecv(s, buffers, bufferCount, bytesRecvd, flags, overlapped, completion)
+        : SOCKET_ERROR;
+    if (g_mode == ProbeMode::Winsock && result != SOCKET_ERROR && bytesRecvd && overlapped == nullptr) {
+        std::size_t totalLength = static_cast<std::size_t>(*bytesRecvd);
+        if (totalLength > 0) {
+            RecordRecvEvent(s, totalLength);
+        }
+    }
+    return result;
 }
 
     void TryTrackWorldSocket(SOCKET socket, const sockaddr* name, int nameLen) {
@@ -950,6 +1055,8 @@ void Configure() {
     }
 
     g_config = ProbeConfig{};
+    g_corrPreMs = 400;
+    g_corrRingCap = 128;
     g_asqCount.store(0);
     g_dropRemaining.store(0);
     g_trackedSocket.store(INVALID_SOCKET);
@@ -962,6 +1069,18 @@ void Configure() {
     if (!LoadConfigFromFile(g_config, configPath)) {
         return;
     }
+
+    if (g_corrRingCap < 32) {
+        g_corrRingCap = 32;
+    }
+    try {
+        g_recvRing.assign(g_corrRingCap, RecvEvent{ 0, 0, 0, 0, 0 });
+    }
+    catch (...) {
+        g_recvRing.clear();
+    }
+    g_recvIdx.store(0, std::memory_order_relaxed);
+    ProbeLogFormatLine("[OpcodeProbe] Correlator: pre_ms={} max_events={}", g_corrPreMs, g_corrRingCap);
 
     if (g_config.hasDropCount) {
         g_dropRemaining.store(static_cast<int>(g_config.dropCount));
