@@ -95,10 +95,15 @@ namespace {
         bool hasMaxPacketBytes = false;
         std::uint32_t debounceMs = 200;
         bool hasDebounceMs = false;
+        std::uint64_t dropSignature = 0;
+        bool hasDropSignature = false;
+        std::uint32_t dropCount = 0;
+        bool hasDropCount = false;
     };
 
     ProbeConfig g_config;
     std::atomic<std::uint32_t> g_asqCount{ 0 };
+    std::atomic<int> g_dropRemaining{ 0 };
     std::atomic<SOCKET> g_trackedSocket{ INVALID_SOCKET };
     std::mutex g_dedupeMutex;
     std::string g_lastLogLine;
@@ -379,6 +384,28 @@ namespace {
                 ProbeLogFormatLine("[OpcodeProbe] Failed to parse debounce_ms on line {}", lineNumber);
             }
         }
+        else if (state.section == "drop" && lowerKey == "drop_if_sig") {
+            std::uint64_t parsed = 0;
+            if (ParseUint64(value, parsed)) {
+                state.config->dropSignature = parsed;
+                state.config->hasDropSignature = true;
+                state.recognized = true;
+            }
+            else {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse drop_if_sig on line {}", lineNumber);
+            }
+        }
+        else if (state.section == "drop" && lowerKey == "drop_count") {
+            std::uint32_t parsed = 0;
+            if (ParseUint32(value, parsed)) {
+                state.config->dropCount = parsed;
+                state.config->hasDropCount = true;
+                state.recognized = true;
+            }
+            else {
+                ProbeLogFormatLine("[OpcodeProbe] Failed to parse drop_count on line {}", lineNumber);
+            }
+        }
         else {
             if (!state.section.empty()) {
                 ProbeLogFormatLine("[OpcodeProbe] Unknown config key '{}' in [{}] on line {}", key, state.section, lineNumber);
@@ -608,6 +635,30 @@ namespace {
         return true;
     }
 
+    bool ShouldDropSig(std::uint64_t sig) {
+        if (!g_config.hasDropSignature || sig != g_config.dropSignature) {
+            return false;
+        }
+
+        if (!g_config.hasDropCount || g_config.dropCount == 0) {
+            return true;
+        }
+
+        for (;;) {
+            int remaining = g_dropRemaining.load(std::memory_order_relaxed);
+            if (remaining <= 0) {
+                return false;
+            }
+            if (g_dropRemaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
     bool ShouldSuppressLog(const std::string& line) {
         if (g_config.debounceMs == 0) {
             return false;
@@ -675,6 +726,19 @@ int WSAAPI hkSend(SOCKET s, const char* buffer, int length, int flags) {
     else if (g_mode == ProbeMode::Winsock && buffer && length > 0) {
         std::size_t totalLength = static_cast<std::size_t>(length);
         if (ShouldLogPacket(s, totalLength)) {
+            auto sig = StackSig();
+            if (ShouldDropSig(sig)) {
+                auto mid = FormatWowFrame(WowFrameRva(4));
+                auto deep = FormatWowFrame(WowFrameRva(8));
+                ProbeLogFormatLine(
+                    "[ASQ][drop] sig=0x{} mid={} deep={} api=send len={}",
+                    ToHex(sig, 16).value,
+                    mid,
+                    deep,
+                    length);
+                WSASetLastError(0);
+                return length;
+            }
             LogWinsockSendSignature("send");
         }
     }
@@ -699,6 +763,22 @@ int WSAAPI hkWSASend(
             }
         }
         if (hasData && ShouldLogPacket(s, totalLength)) {
+            auto sig = StackSig();
+            if (overlapped == nullptr && ShouldDropSig(sig)) {
+                auto mid = FormatWowFrame(WowFrameRva(4));
+                auto deep = FormatWowFrame(WowFrameRva(8));
+                ProbeLogFormatLine(
+                    "[ASQ][drop] sig=0x{} mid={} deep={} api=WSASend len={}",
+                    ToHex(sig, 16).value,
+                    mid,
+                    deep,
+                    totalLength);
+                if (bytesSent) {
+                    *bytesSent = static_cast<DWORD>(totalLength);
+                }
+                WSASetLastError(0);
+                return 0;
+            }
             LogWinsockSendSignature("WSASend");
         }
     }
@@ -871,6 +951,7 @@ void Configure() {
 
     g_config = ProbeConfig{};
     g_asqCount.store(0);
+    g_dropRemaining.store(0);
     g_trackedSocket.store(INVALID_SOCKET);
     {
         std::lock_guard<std::mutex> lock(g_dedupeMutex);
@@ -880,6 +961,10 @@ void Configure() {
     std::string configPath;
     if (!LoadConfigFromFile(g_config, configPath)) {
         return;
+    }
+
+    if (g_config.hasDropCount) {
+        g_dropRemaining.store(static_cast<int>(g_config.dropCount));
     }
 
     std::string lower = ToLower(g_config.phase);
