@@ -13,6 +13,7 @@
 #include "net_trace.h"
 #include "latency.h"
 #include "frame_fence.h"
+#include "call_split.h"
 
 
 #include "task_queue.h"   // RunScheduled()
@@ -78,6 +79,7 @@ static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
     EnableSVKIfPending(); // flip content hooks after first real frame
     HandleHotkeys();      // F7 to cycle active candidate
     RunScheduled();       // your per-frame jobs if any
+    CallSplit_Frame();    // per-frame housekeeping for call de-dupe
     FrameFence_Tick();  // <-- one tick per rendered frame
     return oEndScene(dev);
 }
