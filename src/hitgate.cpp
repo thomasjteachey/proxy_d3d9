@@ -3,10 +3,12 @@
 #include <windows.h>
 #include <vector>
 #include <mutex>
+#include <cstdio>
 
 #include "MinHook.h"
 #include "aob_scan.h"
 #include "task_queue.h"
+#include "frame_fence.h"
 
 static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA("\n"); }
 
@@ -32,8 +34,12 @@ static void HitGate_FlushDeferred()
         pending.swap(gDeferredSVK);
     }
 
-    if (!pending.empty()) {
-        log_line("[ClientFix][HitGate] flush");
+    {
+        char line[128];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] flush frame=%u deferred=%zu",
+            FrameFence_Id(), pending.size());
+        log_line(line);
     }
 
     for (const auto& entry : pending) {
@@ -48,7 +54,11 @@ void HitGate_ArmOneFrame()
     if (!HitGate_IsEnabled()) return;
 
     if (gBlockProcVisuals.exchange(1) == 0) {
-        log_line("[ClientFix][HitGate] armed");
+        char line[128];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] armed frame=%u",
+            FrameFence_Id());
+        log_line(line);
         ScheduleNextFrame([] {
             gBlockProcVisuals.store(0);
             HitGate_FlushDeferred();
@@ -68,9 +78,13 @@ bool HitGate_TryDeferSVK(void* self, int a1, int a2, SVKStarter_t orig)
     {
         std::lock_guard<std::mutex> lock(gDeferredMx);
         gDeferredSVK.push_back({ self, a1, a2, orig });
+        char line[128];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] SVK deferred count=%zu",
+            gDeferredSVK.size());
+        log_line(line);
     }
 
-    log_line("[ClientFix][HitGate] SVK deferred");
     return true;
 }
 
@@ -86,10 +100,11 @@ static AttackerStateHandler_t gAttackerStateHandler = nullptr;
 static void __fastcall hkAttackerStateHandler(void* self, void* /*edx*/, void* pkt)
 {
     ++tls_in14a;
-    HitGate_ArmOneFrame();
+    log_line("[ClientFix][HitGate] attackerstate handler hit");
     if (gAttackerStateHandler) {
         gAttackerStateHandler(self, pkt);
     }
+    HitGate_ArmOneFrame();
     --tls_in14a;
 }
 
