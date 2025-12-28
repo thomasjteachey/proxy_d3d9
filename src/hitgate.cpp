@@ -12,6 +12,7 @@ static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA(
 
 static std::atomic<long> gHitGateOn{ 1 };
 static std::atomic<long> gBlockProcVisuals{ 0 };
+static thread_local int tls_in14a = 0;
 
 struct DeferredSVK {
     void* self;
@@ -58,6 +59,10 @@ void HitGate_ArmOneFrame()
 bool HitGate_TryDeferSVK(void* self, int a1, int a2, SVKStarter_t orig)
 {
     if (!HitGate_IsEnabled()) return false;
+    if (tls_in14a > 0) {
+        log_line("[ClientFix][HitGate] SVK immediate (tls_in14a)");
+        return false;
+    }
     if (gBlockProcVisuals.load() == 0) return false;
 
     {
@@ -80,10 +85,12 @@ static AttackerStateHandler_t gAttackerStateHandler = nullptr;
 
 static void __fastcall hkAttackerStateHandler(void* self, void* /*edx*/, void* pkt)
 {
+    ++tls_in14a;
     HitGate_ArmOneFrame();
     if (gAttackerStateHandler) {
         gAttackerStateHandler(self, pkt);
     }
+    --tls_in14a;
 }
 
 static void* ResolveAttackerStateHandler()

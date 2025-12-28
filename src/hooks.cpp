@@ -77,8 +77,8 @@ static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
 {
     EnableSVKIfPending(); // flip content hooks after first real frame
     HandleHotkeys();      // F7 to cycle active candidate
-    RunScheduled();       // your per-frame jobs if any
-    FrameFence_Tick();  // <-- one tick per rendered frame
+    FrameFence_Tick();    // <-- one tick per rendered frame
+    RunScheduled(FrameFence_Id()); // your per-frame jobs if any
     return oEndScene(dev);
 }
 void InstallEndSceneHook(IDirect3DDevice9* dev)

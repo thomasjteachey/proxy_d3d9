@@ -110,9 +110,6 @@
     <ClCompile Include="net_trace.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-        <ClCompile Include="net_recv_hooks.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="frame_fence.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
