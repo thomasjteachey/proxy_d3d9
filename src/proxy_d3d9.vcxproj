@@ -200,7 +200,6 @@
     <ClCompile Include="hitgate.cpp" />
     <ClCompile Include="hooks.cpp" />
     <ClCompile Include="hook_init.cpp" />
-        <ClCompile Include="net_recv_hooks.cpp" />
         <ClCompile Include="net_trace.cpp" />
     <ClCompile Include="svk_scan.cpp" />
     <ClCompile Include="task_queue.cpp" />
