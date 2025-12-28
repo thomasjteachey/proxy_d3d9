@@ -7,9 +7,6 @@
 #include "hooks.h"   // InstallEndSceneHook, InstallCombatHooks
 #include "svk_scan.h"
 #include "net_trace.h"
-#include "latency.h"
-#include "net_split.h"
-#include "call_split.h"
 
 static std::once_flag gOnce;
 static std::atomic<bool> gEndSceneHooked{ false };
@@ -29,9 +26,6 @@ static HRESULT STDMETHODCALLTYPE hkCreateDevice(IDirect3D9* self, UINT a, D3DDEV
     return hr;
 }
 
-// IDirect3D9Ex::CreateDeviceEx (index differs; we’ll hook both)
-using CreateDeviceEx_t = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
-static CreateDeviceEx_t oCreateDeviceEx = nullptr;
 
 static HRESULT STDMETHODCALLTYPE hkCreateDeviceEx(IDirect3D9Ex* self, UINT a, D3DDEVTYPE b, HWND c, DWORD d,
     D3DPRESENT_PARAMETERS* pp, D3DDISPLAYMODEEX* md, IDirect3DDevice9Ex** out)
@@ -52,7 +46,7 @@ void InitHooksOnce()
         CallSplit_Init();   // <-- add this
         NetTrace::Init();
         NetSplit_Init();
-        // Pattern-scan & attach combat hooks (safe if patterns not set—they’ll just no-op).
+        // Pattern-scan & attach combat hooks (safe if patterns not setâ€”theyâ€™ll just no-op).
         InstallCombatHooks();
         OutputDebugStringA("[ClientFix] InitHooksOnce()\n");
     });
