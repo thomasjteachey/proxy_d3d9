@@ -3,6 +3,7 @@
 #include <d3d9.h>
 #include <mutex>
 #include <atomic>
+#include <unordered_set>
 #include "MinHook.h"
 #include "hooks.h"   // InstallEndSceneHook, InstallCombatHooks
 #include "svk_scan.h"
@@ -13,7 +14,11 @@ static std::atomic<bool> gEndSceneHooked{ false };
 
 // ---- CreateDevice hooks ----
 using CreateDevice_t = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+using CreateDeviceEx_t = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
 static CreateDevice_t oCreateDevice = nullptr;
+static CreateDeviceEx_t oCreateDeviceEx = nullptr;
+static std::mutex gHookTargetsMutex;
+static std::unordered_set<void*> gHookTargets;
 
 static HRESULT STDMETHODCALLTYPE hkCreateDevice(IDirect3D9* self, UINT a, D3DDEVTYPE b, HWND c, DWORD d,
     D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out)
@@ -42,10 +47,7 @@ void InitHooksOnce()
 {
     std::call_once(gOnce, [] {
         MH_Initialize();
-        Latency_Init();   // <-- add this line
-        CallSplit_Init();   // <-- add this
         NetTrace::Init();
-        NetSplit_Init();
         // Pattern-scan & attach combat hooks (safe if patterns not set—they’ll just no-op).
         InstallCombatHooks();
         OutputDebugStringA("[ClientFix] InitHooksOnce()\n");
@@ -57,6 +59,12 @@ void InstallCreateDeviceHooks(IDirect3D9* d3d9)
     if (!d3d9) return;
     void** vt = *reinterpret_cast<void***>(d3d9);
     void* target = vt[16];                 // IDirect3D9::CreateDevice
+    {
+        std::lock_guard<std::mutex> lock(gHookTargetsMutex);
+        if (!gHookTargets.insert(target).second) {
+            return;
+        }
+    }
     MH_CreateHook(target, hkCreateDevice, reinterpret_cast<void**>(&oCreateDevice));
     MH_EnableHook(target);
     OutputDebugStringA("[ClientFix] Hooked IDirect3D9::CreateDevice\n");
@@ -68,6 +76,12 @@ void InstallCreateDeviceExHooks(IDirect3D9Ex* d3d9ex)
     void** vt = *reinterpret_cast<void***>(d3d9ex);
     // IDirect3D9Ex vtable: CreateDeviceEx is typically index 20
     void* target = vt[20];
+    {
+        std::lock_guard<std::mutex> lock(gHookTargetsMutex);
+        if (!gHookTargets.insert(target).second) {
+            return;
+        }
+    }
     MH_CreateHook(target, hkCreateDeviceEx, reinterpret_cast<void**>(&oCreateDeviceEx));
     MH_EnableHook(target);
     OutputDebugStringA("[ClientFix] Hooked IDirect3D9Ex::CreateDeviceEx\n");
