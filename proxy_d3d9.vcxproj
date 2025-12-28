@@ -86,7 +86,7 @@
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\3rdparty\minhook\include;%(AdditionalIncludeDirectories)
+      <AdditionalIncludeDirectories>$(ProjectDir)3rdparty\minhook\include;%(AdditionalIncludeDirectories)
 </AdditionalIncludeDirectories>
       <CompileAs>CompileAsCpp</CompileAs>
     </ClCompile>
@@ -110,7 +110,7 @@
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\3rdparty\minhook\include;%(AdditionalIncludeDirectories)
+      <AdditionalIncludeDirectories>$(ProjectDir)3rdparty\minhook\include;%(AdditionalIncludeDirectories)
 </AdditionalIncludeDirectories>
       <CompileAs>CompileAsCpp</CompileAs>
     </ClCompile>
@@ -157,14 +157,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\3rdparty\minhook\include\MinHook.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\buffer.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\hde\hde32.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\hde\hde64.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\hde\pstdint.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\hde\table32.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\hde\table64.h" />
-    <ClInclude Include="..\3rdparty\minhook\src\trampoline.h" />
+    <ClInclude Include="3rdparty\minhook\include\MinHook.h" />
+    <ClInclude Include="3rdparty\minhook\src\buffer.h" />
+    <ClInclude Include="3rdparty\minhook\src\hde\hde32.h" />
+    <ClInclude Include="3rdparty\minhook\src\hde\hde64.h" />
+    <ClInclude Include="3rdparty\minhook\src\hde\pstdint.h" />
+    <ClInclude Include="3rdparty\minhook\src\hde\table32.h" />
+    <ClInclude Include="3rdparty\minhook\src\hde\table64.h" />
+    <ClInclude Include="3rdparty\minhook\src\trampoline.h" />
     <ClInclude Include="aob_scan.h" />
         <ClInclude Include="framework.h" />
     <ClInclude Include="frame_fence.h" />
@@ -177,11 +177,11 @@
     <ClInclude Include="timing.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\3rdparty\minhook\src\buffer.c" />
-    <ClCompile Include="..\3rdparty\minhook\src\hde\hde32.c" />
-    <ClCompile Include="..\3rdparty\minhook\src\hde\hde64.c" />
-    <ClCompile Include="..\3rdparty\minhook\src\hook.c" />
-    <ClCompile Include="..\3rdparty\minhook\src\trampoline.c" />
+    <ClCompile Include="3rdparty\minhook\src\buffer.c" />
+    <ClCompile Include="3rdparty\minhook\src\hde\hde32.c" />
+    <ClCompile Include="3rdparty\minhook\src\hde\hde64.c" />
+    <ClCompile Include="3rdparty\minhook\src\hook.c" />
+    <ClCompile Include="3rdparty\minhook\src\trampoline.c" />
     <ClCompile Include="aob_scan.cpp" />
         <ClCompile Include="d3d9_proxy.cpp" />
     <ClCompile Include="frame_fence.cpp" />
