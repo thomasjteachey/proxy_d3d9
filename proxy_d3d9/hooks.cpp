@@ -11,8 +11,8 @@
 #include <cstring>
 #include <intrin.h>
 #include "net_trace.h"
-#include "latency.h"
 #include "frame_fence.h"
+#include "hitgate.h"
 
 
 #include "task_queue.h"   // RunScheduled()
@@ -94,8 +94,6 @@ void InstallEndSceneHook(IDirect3DDevice9* dev)
 }
 
 // --------------- SVK starter hooks (multi-candidate; only 1 enabled) ---------------
-using SVKStarter_t = void(__thiscall*)(void* self, int a1, int a2);
-
 struct SVKCand {
     uint8_t* start;   // hooked function start (callee)
     SVKStarter_t orig;   // trampoline
@@ -128,6 +126,10 @@ static void __fastcall hkSVK_Any(void* self, void* /*edx*/, int a1, int a2)
             "[ClientFix] SVK HIT[cand %d]: self=%p a1=%d a2=%d caller=%p",
             active, self, a1, a2, callerStart);
         dbgln(line);
+    }
+
+    if (callOrig && HitGate_TryDeferSVK(self, a1, a2, callOrig)) {
+        return;
     }
 
     if (callOrig) {
@@ -277,4 +279,5 @@ void InstallCombatHooks()
     gCombatHooksInstalled = true;
 
     DiscoverSVKCallers(); // find & create hooks (deferred)
+    HitGate_Init();
 }

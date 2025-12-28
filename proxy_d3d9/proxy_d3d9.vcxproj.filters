@@ -60,19 +60,13 @@
     <ClInclude Include="svk_scan.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="net_trace.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="latency.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="net_split.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="call_split.h">
+        <ClInclude Include="net_trace.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="frame_fence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="hitgate.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -116,19 +110,13 @@
     <ClCompile Include="net_trace.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="net_recv_hooks.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="latency.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="net_split.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="call_split.cpp">
+        <ClCompile Include="net_recv_hooks.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="frame_fence.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="hitgate.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
