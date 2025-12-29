@@ -11,6 +11,7 @@
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <cstdint>
 #pragma comment(lib, "winmm.lib")
 
 static volatile LONG g_frame = 0;
