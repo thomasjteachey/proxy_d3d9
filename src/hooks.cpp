@@ -175,8 +175,11 @@ void InstallCombatHooks()
             MH_EnableHook((LPVOID)gSVKLoaderStart) == MH_OK) {
             dbgln("[ClientFix] SVK loader hook installed");
             gSVKHookArmed = true;
-        } else {
+        }
+        else {
             dbgln("[ClientFix] SVK loader hook FAILED");
         }
     }
+
+    HitGate_Init();   // <-- ADD (installs dispatch callsite hook)
 }
