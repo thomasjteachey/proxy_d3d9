@@ -72,8 +72,17 @@ static EndScene_t oEndScene = nullptr;
 static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
 {
     HitGate_SetRenderThreadId(static_cast<uint32_t>(GetCurrentThreadId()));
+    FrameFence_SetRenderThreadId(static_cast<uint32_t>(GetCurrentThreadId()));
     FrameFence_Tick();    // <-- one tick per rendered frame
     RunScheduled(FrameFence_Id()); // your per-frame jobs if any
+    static DWORD s_last = 0;
+    DWORD now = GetTickCount();
+    if (now - s_last > 1000) {
+        s_last = now;
+        dbgprintf("[ClientFix][HitGate] dispatchHits=%u saw14A=%u lastOpcode=0x%X dispatchTid=%u renderTid=%u frame=%u",
+            HitGate_GetDispatchHits(), HitGate_GetSaw14A(), HitGate_GetLastOpcode(),
+            HitGate_GetLastDispatchTid(), FrameFence_RenderThreadId(), FrameFence_Id());
+    }
     return oEndScene(dev);
 }
 void InstallEndSceneHook(IDirect3DDevice9* dev)
