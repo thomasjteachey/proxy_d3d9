@@ -79,8 +79,8 @@ static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
     DWORD now = GetTickCount();
     if (now - s_last > 1000) {
         s_last = now;
-        dbgprintf("[ClientFix][HitGate] dispatchHits=%u saw14A=%u lastOpcode=0x%X dispatchTid=%u renderTid=%u frame=%u",
-            HitGate_GetDispatchHits(), HitGate_GetSaw14A(), HitGate_GetLastOpcode(),
+        dbgprintf("[ClientFix][HitGate] dispatchHits=%u saw14A=%u saw14ATid=%u lastOpcode=0x%X dispatchTid=%u renderTid=%u frame=%u",
+            HitGate_GetDispatchHits(), HitGate_GetSaw14A(), HitGate_GetSaw14ATid(), HitGate_GetLastOpcode(),
             HitGate_GetLastDispatchTid(), FrameFence_RenderThreadId(), FrameFence_Id());
     }
     return oEndScene(dev);

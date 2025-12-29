@@ -11,5 +11,6 @@ bool HitGate_IsEnabled();
 void HitGate_SetRenderThreadId(uint32_t tid);
 uint32_t HitGate_GetDispatchHits();
 uint32_t HitGate_GetSaw14A();
+uint32_t HitGate_GetSaw14ATid();
 uint32_t HitGate_GetLastOpcode();
 uint32_t HitGate_GetLastDispatchTid();
