@@ -320,12 +320,29 @@ static uintptr_t NormalizePtr(uintptr_t ptr, uintptr_t imageStart, size_t imageS
     return ptr;
 }
 
+static bool ResolveTableEntryVA(uint32_t raw, uintptr_t base, uintptr_t imageEnd, uintptr_t& outVA)
+{
+    uintptr_t rawPtr = static_cast<uintptr_t>(raw);
+    if (rawPtr >= base && rawPtr < imageEnd) {
+        outVA = rawPtr;
+        return true;
+    }
+
+    uintptr_t va = base + rawPtr;
+    if (va >= base && va < imageEnd) {
+        outVA = va;
+        return true;
+    }
+
+    return false;
+}
+
 static bool PtrInRange(uintptr_t ptr, uintptr_t start, uintptr_t end)
 {
     return ptr >= start && ptr < end;
 }
 
-static bool FindOpcodeTable(uintptr_t& outTable, int& outScore, bool& outLikelyRva)
+static bool FindOpcodeTable(uintptr_t& outTable, int& outScore)
 {
     uint8_t* textBase = nullptr; size_t textSize = 0;
     uint8_t* imageBase = nullptr; size_t imageSize = 0;
@@ -341,7 +358,7 @@ static bool FindOpcodeTable(uintptr_t& outTable, int& outScore, bool& outLikelyR
     const size_t entryCount = 512;
     const int minScore = 300;
 
-    auto scan_section = [&](uint8_t* base, size_t size, uintptr_t& bestTable, int& bestScore, bool& bestRva) {
+    auto scan_section = [&](uint8_t* base, size_t size, uintptr_t& bestTable, int& bestScore) {
         uintptr_t start = reinterpret_cast<uintptr_t>(base);
         uintptr_t end = start + size;
         for (uintptr_t addr = start; addr + (entryCount * sizeof(uintptr_t)) <= end; addr += sizeof(uintptr_t)) {
@@ -360,25 +377,21 @@ static bool FindOpcodeTable(uintptr_t& outTable, int& outScore, bool& outLikelyR
             uintptr_t normalized = NormalizePtr(entry, imageStart, imageSize);
             if (!PtrInRange(normalized, textStart, textEnd)) continue;
 
-            bool looksRva = !PtrInRange(entry, textStart, textEnd) && PtrInRange(normalized, textStart, textEnd);
             if (score > bestScore) {
                 bestScore = score;
                 bestTable = addr;
-                bestRva = looksRva;
             }
         }
     };
 
     uintptr_t bestTable = 0;
     int bestScore = -1;
-    bool bestRva = false;
-    scan_section(rdataBase, rdataSize, bestTable, bestScore, bestRva);
-    scan_section(dataBase, dataSize, bestTable, bestScore, bestRva);
+    scan_section(rdataBase, rdataSize, bestTable, bestScore);
+    scan_section(dataBase, dataSize, bestTable, bestScore);
 
     if (!bestTable) return false;
     outTable = bestTable;
     outScore = bestScore;
-    outLikelyRva = bestRva;
     return true;
 }
 
@@ -412,27 +425,49 @@ static void LogOpcodeTable(uintptr_t tableAddr, int score)
 
     uintptr_t entry = 0;
     if (ReadPtr(tableAddr + (0x14A * sizeof(uintptr_t)), entry)) {
-        uintptr_t normalized = NormalizePtr(entry, imageStart, imageSize);
+        uintptr_t handlerVa = 0;
+        bool resolved = ResolveTableEntryVA(static_cast<uint32_t>(entry), imageStart, imageStart + imageSize, handlerVa);
         std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] table[0x14A]=0x%08X%s",
-            static_cast<uint32_t>(normalized),
-            PtrInRange(normalized, textStart, textEnd) ? "" : " (NOT IN .text)");
+            "[ClientFix][HitGate] table[0x14A] raw=0x%08X%s va=0x%08X%s",
+            static_cast<uint32_t>(entry),
+            resolved ? "" : " (BAD)",
+            static_cast<uint32_t>(handlerVa),
+            PtrInRange(handlerVa, textStart, textEnd) ? "" : " (NOT IN .text)");
         log_line(line);
     }
 }
 
-static bool PatchOpcode14A(uintptr_t tableAddr, bool tableLooksRva)
+static bool PatchOpcode14A(uintptr_t tableAddr)
 {
-    if (tableLooksRva) {
-        log_line("[ClientFix][HitGate] opcode table appears to store RVAs; skipping 0x14A patch");
-        return false;
-    }
+    uint8_t* imageBase = nullptr; size_t imageSize = 0;
+    if (!GetImageRange(imageBase, imageSize)) return false;
+    uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageBase);
+    uintptr_t imageEnd = imageStart + imageSize;
 
     uintptr_t entryAddr = tableAddr + (0x14A * sizeof(uintptr_t));
     uintptr_t entry = 0;
     if (!ReadPtr(entryAddr, entry)) return false;
 
-    gOrig14A = reinterpret_cast<void*>(entry);
+    uintptr_t handlerVa = 0;
+    uint32_t rawEntry = static_cast<uint32_t>(entry);
+    if (!ResolveTableEntryVA(rawEntry, imageStart, imageEnd, handlerVa)) {
+        char line[200];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] table[0x14A]=0x%08X not VA/RVA in image; abort",
+            rawEntry);
+        log_line(line);
+        return false;
+    }
+
+    {
+        char line[200];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] table[0x14A] raw=0x%08X -> handlerVA=0x%08X (base=0x%p)",
+            rawEntry, static_cast<uint32_t>(handlerVa), reinterpret_cast<void*>(imageStart));
+        log_line(line);
+    }
+
+    gOrig14A = reinterpret_cast<void*>(handlerVa);
 
     DWORD oldProt = 0;
     if (!VirtualProtect(reinterpret_cast<void*>(entryAddr), sizeof(uintptr_t), PAGE_READWRITE, &oldProt)) {
@@ -453,7 +488,7 @@ static bool PatchOpcode14A(uintptr_t tableAddr, bool tableLooksRva)
     char line[200];
     std::snprintf(line, sizeof(line),
         "[ClientFix][HitGate] patched table[0x14A] orig=0x%08X wrapper=0x%08X",
-        static_cast<uint32_t>(entry),
+        static_cast<uint32_t>(handlerVa),
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&My14AWrapper)));
     log_line(line);
     return true;
@@ -571,12 +606,11 @@ void HitGate_Init()
 {
     uintptr_t opcodeTable = 0;
     int opcodeScore = 0;
-    bool opcodeLooksRva = false;
-    if (FindOpcodeTable(opcodeTable, opcodeScore, opcodeLooksRva)) {
+    if (FindOpcodeTable(opcodeTable, opcodeScore)) {
         gOpcodeTable = opcodeTable;
         gOpcodeTableScore = opcodeScore;
         LogOpcodeTable(opcodeTable, opcodeScore);
-        PatchOpcode14A(opcodeTable, opcodeLooksRva);
+        PatchOpcode14A(opcodeTable);
     } else {
         log_line("[ClientFix][HitGate] opcode handler table not found");
     }
