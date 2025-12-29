@@ -267,7 +267,7 @@ static void EnableSVKIfPending()
     once = true;
 
     // Choose index 0 by default (if any), disable all others
-    if (!gCands.empty()) EnableOnly(0);
+    if (gActiveIdx < 0 && !gCands.empty()) EnableOnly(0);
 }
 
 // ------------------------- Install all (called once) ------------------
@@ -279,5 +279,9 @@ void InstallCombatHooks()
     gCombatHooksInstalled = true;
 
     DiscoverSVKCallers(); // find & create hooks (deferred)
+    if (gActiveIdx < 0 && !gCands.empty()) {
+        dbgln("[ClientFix] SVK forcing enable candidate 0");
+        EnableOnly(0);
+    }
     HitGate_Init();
 }
