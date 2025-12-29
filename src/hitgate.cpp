@@ -57,6 +57,18 @@ static int gDispatchScore = 0;
 static uintptr_t gOpcodeTable = 0;
 static int gOpcodeTableScore = 0;
 
+struct JmpDetour {
+    uint8_t* target = nullptr;
+    uint8_t* detour = nullptr;
+    uint8_t stolen[8] = {};
+    size_t stolenLen = 0;
+    uint8_t* trampoline = nullptr;
+};
+
+static uint8_t* gOpcode14AStub = nullptr;
+static uint8_t* gOpcode14ATrampoline = nullptr;
+static JmpDetour gOpcode14ADetour;
+
 static void MaybeLogThreadIds();
 
 struct DeferredSVK {
@@ -539,6 +551,93 @@ static uint8_t* BuildOpcodeWrapperStub(uint32_t opcode, uintptr_t origHandler)
     return stub;
 }
 
+static uint8_t* BuildOpcodeHitStub(void (*hitFn)(), uintptr_t trampoline, size_t* outTrampolineOffset)
+{
+    std::vector<uint8_t> code;
+    auto emit = [&code](uint8_t b) { code.push_back(b); };
+    auto emit32 = [&code](uint32_t v) {
+        code.push_back(static_cast<uint8_t>(v));
+        code.push_back(static_cast<uint8_t>(v >> 8));
+        code.push_back(static_cast<uint8_t>(v >> 16));
+        code.push_back(static_cast<uint8_t>(v >> 24));
+    };
+
+    emit(0x9C); // pushfd
+    emit(0x60); // pushad
+    emit(0xE8); // call rel32
+    size_t callRelPos = code.size();
+    emit32(0);
+    emit(0x61); // popad
+    emit(0x9D); // popfd
+    emit(0xB8); // mov eax, imm32
+    size_t trampolineOffset = code.size();
+    emit32(static_cast<uint32_t>(trampoline));
+    emit(0xFF); emit(0xE0); // jmp eax
+
+    uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, code.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) return nullptr;
+
+    std::memcpy(stub, code.data(), code.size());
+    int32_t callRel = reinterpret_cast<uint8_t*>(hitFn) -
+        (stub + callRelPos + sizeof(int32_t));
+    std::memcpy(stub + callRelPos, &callRel, sizeof(callRel));
+    if (outTrampolineOffset) {
+        *outTrampolineOffset = trampolineOffset;
+    }
+
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    return stub;
+}
+
+static bool Hook32_JmpDetour(void* target, void* detour, JmpDetour& out)
+{
+    if (!target || !detour) return false;
+    out.target = static_cast<uint8_t*>(target);
+    out.detour = static_cast<uint8_t*>(detour);
+    out.stolenLen = 5;
+
+    std::memcpy(out.stolen, out.target, out.stolenLen);
+
+    size_t trampSize = out.stolenLen + 5;
+    out.trampoline = static_cast<uint8_t*>(VirtualAlloc(nullptr, trampSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!out.trampoline) return false;
+
+    std::memcpy(out.trampoline, out.stolen, out.stolenLen);
+    out.trampoline[out.stolenLen] = 0xE9;
+    int32_t backRel = (out.target + out.stolenLen) - (out.trampoline + out.stolenLen + 5);
+    std::memcpy(out.trampoline + out.stolenLen + 1, &backRel, sizeof(backRel));
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(out.target, out.stolenLen, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        return false;
+    }
+
+    out.target[0] = 0xE9;
+    int32_t detourRel = out.detour - (out.target + 5);
+    std::memcpy(out.target + 1, &detourRel, sizeof(detourRel));
+
+    DWORD ignore = 0;
+    VirtualProtect(out.target, out.stolenLen, oldProt, &ignore);
+    FlushInstructionCache(GetCurrentProcess(), out.target, out.stolenLen);
+    FlushInstructionCache(GetCurrentProcess(), out.trampoline, trampSize);
+    return true;
+}
+
+static bool GetModuleRange(HMODULE mod, uintptr_t& start, uintptr_t& end)
+{
+    if (!mod) return false;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+        reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    start = reinterpret_cast<uintptr_t>(mod);
+    end = start + nt->OptionalHeader.SizeOfImage;
+    return true;
+}
+
 static bool WriteTableEntry(uintptr_t entryAddr, uint32_t rawValue)
 {
     DWORD oldProt = 0;
@@ -592,6 +691,54 @@ static bool PatchOpcodeTableProbes(uintptr_t tableAddr)
             "[ClientFix][HitGate] tableEncoding=%s vaHits=%d rvaHits=%d",
             mode, vaHits, rvaHits);
         log_line(line);
+    }
+
+    if (encoding == TableEncoding::RVA) {
+        uintptr_t entryAddr = tableAddr + (0x14A * sizeof(uintptr_t));
+        uintptr_t entry = 0;
+        if (!ReadPtr(entryAddr, entry)) {
+            log_line("[ClientFix][HitGate] table[0x14A] read failed");
+            return false;
+        }
+
+        uint32_t rawEntry = static_cast<uint32_t>(entry);
+        uintptr_t handlerVa = 0;
+        if (!ResolveEntryByEncoding(rawEntry, encoding, imageStart, imageEnd, handlerVa)) {
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] table[0x14A]=0x%08X not RVA in image; skip detour",
+                rawEntry);
+            log_line(line);
+            return false;
+        }
+
+        size_t trampolineOffset = 0;
+        uint8_t* stub = BuildOpcodeHitStub(&OnOpcode14AHit, 0, &trampolineOffset);
+        if (!stub) {
+            log_line("[ClientFix][HitGate] opcode 0x14A stub alloc failed");
+            return false;
+        }
+
+        if (!Hook32_JmpDetour(reinterpret_cast<void*>(handlerVa), stub, gOpcode14ADetour)) {
+            log_line("[ClientFix][HitGate] opcode 0x14A detour failed");
+            return false;
+        }
+
+        gOpcode14AStub = stub;
+        gOpcode14ATrampoline = gOpcode14ADetour.trampoline;
+        uint32_t trampVal = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(gOpcode14ATrampoline));
+        std::memcpy(gOpcode14AStub + trampolineOffset, &trampVal, sizeof(trampVal));
+        FlushInstructionCache(GetCurrentProcess(), gOpcode14AStub, 32);
+
+        char line[240];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] detoured 0x14A handler=0x%08X raw=0x%08X stub=0x%p tramp=0x%p",
+            static_cast<uint32_t>(handlerVa),
+            rawEntry,
+            gOpcode14AStub,
+            gOpcode14ATrampoline);
+        log_line(line);
+        return true;
     }
 
     std::vector<uint16_t> opcodes;
@@ -755,6 +902,39 @@ static const char* GetExeBasename(char* out, size_t outSize)
 
 void HitGate_Init()
 {
+    {
+        uintptr_t exeStart = 0;
+        uintptr_t exeEnd = 0;
+        if (GetModuleRange(GetModuleHandleA(nullptr), exeStart, exeEnd)) {
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] wow.exe base=0x%p end=0x%p size=0x%X",
+                reinterpret_cast<void*>(exeStart),
+                reinterpret_cast<void*>(exeEnd),
+                static_cast<unsigned int>(exeEnd - exeStart));
+            log_line(line);
+        }
+
+        uintptr_t dllStart = 0;
+        uintptr_t dllEnd = 0;
+        HMODULE dllMod = GetModuleHandleA("d3d9.dll");
+        if (GetModuleRange(dllMod, dllStart, dllEnd)) {
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] d3d9.dll base=0x%p end=0x%p size=0x%X",
+                reinterpret_cast<void*>(dllStart),
+                reinterpret_cast<void*>(dllEnd),
+                static_cast<unsigned int>(dllEnd - dllStart));
+            log_line(line);
+        }
+
+        char line[200];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] OnOpcode14AHit=0x%p",
+            reinterpret_cast<void*>(&OnOpcode14AHit));
+        log_line(line);
+    }
+
     uintptr_t opcodeTable = 0;
     int opcodeScore = 0;
     if (FindOpcodeTable(opcodeTable, opcodeScore)) {
