@@ -32,6 +32,12 @@ struct DeferredSVK {
 static std::mutex gDeferredMx;
 static std::vector<DeferredSVK> gDeferredSVK;
 
+static void SafeCallSVK(void* self, int a1, int a2, SVKStarter_t orig)
+{
+    __try { orig(self, a1, a2); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static void HitGate_FlushDeferred()
 {
     std::vector<DeferredSVK> pending;
@@ -50,8 +56,7 @@ static void HitGate_FlushDeferred()
 
     for (const auto& entry : pending) {
         if (entry.orig) {
-            __try { entry.orig(entry.self, entry.a1, entry.a2); }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            SafeCallSVK(entry.self, entry.a1, entry.a2, entry.orig);
         }
     }
 }
