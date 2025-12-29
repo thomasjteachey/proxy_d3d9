@@ -377,6 +377,26 @@ static bool FindDispatchCallsite()
     return true;
 }
 
+static const char* GetExeBasename(char* out, size_t outSize)
+{
+    if (outSize == 0) return "";
+    out[0] = '\0';
+    char path[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(nullptr, path, static_cast<DWORD>(sizeof(path)));
+    if (len == 0) return "";
+    const char* lastSlash = strrchr(path, '\\');
+    const char* lastFwd = strrchr(path, '/');
+    const char* last = lastSlash ? lastSlash : lastFwd;
+    if (lastFwd && lastSlash) {
+        last = (lastFwd > lastSlash) ? lastFwd : lastSlash;
+    } else if (lastFwd) {
+        last = lastFwd;
+    }
+    const char* exe = (last && *(last + 1) != '\0') ? last + 1 : path;
+    std::snprintf(out, outSize, "%s", exe);
+    return out;
+}
+
 void HitGate_Init()
 {
     if (!FindDispatchCallsite()) {
@@ -447,8 +467,33 @@ void HitGate_Init()
             beforeText, afterText);
         log_line(line);
     }
+    bool patchOk = true;
     if (std::memcmp(before, after, sizeof(before)) == 0) {
         log_line("[ClientFix][HitGate] dispatch callsite bytes unchanged after patch");
+        patchOk = false;
+    }
+    if (after[0] != 0xE8) {
+        log_line("[ClientFix][HitGate] PATCH FAILED: callsite does not start with E8");
+        patchOk = false;
+    }
+    if (!patchOk) {
+        gHitGateOn.store(0);
+        return;
+    }
+
+    {
+        char exeName[MAX_PATH] = {};
+        GetExeBasename(exeName, sizeof(exeName));
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] PID=%lu EXE=%s base=0x%p callsite=0x%p table=0x%08X AFTER=%s",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            exeName[0] ? exeName : "(unknown)",
+            GetModuleHandleA(nullptr),
+            gDispatchCallsite,
+            gDispatchTableDisp,
+            afterText);
+        log_line(line);
     }
 
     {
