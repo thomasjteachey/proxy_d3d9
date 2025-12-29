@@ -16,11 +16,20 @@ static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA(
 static std::atomic<long> gHitGateOn{ 1 };
 static std::atomic<long> gBlockProcVisuals{ 0 };
 
+static std::atomic<uint32_t> gRenderTid{ 0 };
+static std::atomic<uint32_t> gDispatchTid{ 0 };
+static std::atomic<bool> gTidLogged{ false };
+
+static std::atomic<uint32_t> gHoldUntilFrame{ 0 };
+static std::atomic<int> gHoldBudget{ 0 };
+
 static uint8_t* gDispatchCallsite = nullptr;
 static uint32_t gDispatchTableDisp = 0;
 static uint8_t* gDispatchRet = nullptr;
 static bool gDispatchUsesEcx = false;
 static uint8_t* gDispatchStub = nullptr;
+
+static void MaybeLogThreadIds();
 
 struct DeferredSVK {
     void* self;
@@ -101,12 +110,84 @@ bool HitGate_IsEnabled()
     return gHitGateOn.load() != 0;
 }
 
+void HitGate_SetRenderThreadId(uint32_t tid)
+{
+    uint32_t expected = 0;
+    if (gRenderTid.compare_exchange_strong(expected, tid)) {
+        FrameFence_Init();
+    }
+    MaybeLogThreadIds();
+}
+
+static void MaybeLogThreadIds()
+{
+    if (gTidLogged.load()) return;
+    uint32_t render = gRenderTid.load();
+    uint32_t dispatch = gDispatchTid.load();
+    if (render == 0 || dispatch == 0) return;
+    if (!gTidLogged.exchange(true)) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] thread ids render=%lu dispatch=%lu",
+            static_cast<unsigned long>(render),
+            static_cast<unsigned long>(dispatch));
+        log_line(line);
+    }
+}
+
 // -------------------- dispatch callsite hook --------------------
 static void __cdecl OnDispatchEnter(uint32_t opcode)
 {
-    if (opcode != 0x14A) return;
-    log_line("[ClientFix][HitGate] HitGate armed (opcode 0x14A)");
-    HitGate_ArmOneFrame();
+    if (!HitGate_IsEnabled()) return;
+
+    uint32_t expected = 0;
+    gDispatchTid.compare_exchange_strong(expected, GetCurrentThreadId());
+    MaybeLogThreadIds();
+
+    if (opcode == 0x14A) {
+        const uint32_t hold = FrameFence_Id() + 1;
+        gHoldUntilFrame.store(hold);
+        gHoldBudget.store(16);
+        char line[128];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] hold armed opcode=0x14A until=%u",
+            hold);
+        log_line(line);
+        return;
+    }
+
+    const uint32_t hold = gHoldUntilFrame.load();
+    if (hold == 0) return;
+    if (gHoldBudget.load() <= 0) {
+        gHoldUntilFrame.store(0);
+        return;
+    }
+
+    const uint32_t renderTid = gRenderTid.load();
+    const uint32_t dispatchTid = gDispatchTid.load();
+    if (renderTid != 0 && renderTid == dispatchTid) {
+        gHoldUntilFrame.store(0);
+        gHoldBudget.store(0);
+        return;
+    }
+
+    if (renderTid == 0 || dispatchTid == 0) {
+        if (FrameFence_Id() >= hold) gHoldUntilFrame.store(0);
+        return;
+    }
+
+    const int budgetBefore = gHoldBudget.fetch_sub(1);
+    if (budgetBefore > 0) {
+        const DWORD start = GetTickCount();
+        while (FrameFence_Id() < hold) {
+            if (GetTickCount() - start > 50) break;
+            Sleep(0);
+        }
+    }
+
+    if (FrameFence_Id() >= hold || gHoldBudget.load() <= 0) {
+        gHoldUntilFrame.store(0);
+    }
 }
 
 static uint8_t* BuildDispatchStub(bool usesEcx, uint32_t tableDisp, uint8_t* retaddr)

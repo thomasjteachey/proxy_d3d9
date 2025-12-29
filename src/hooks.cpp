@@ -11,6 +11,7 @@
 #include <intrin.h>
 #include "net_trace.h"
 #include "frame_fence.h"
+#include "hitgate.h"
 
 
 #include "task_queue.h"   // RunScheduled()
@@ -70,6 +71,7 @@ static EndScene_t oEndScene = nullptr;
 
 static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
 {
+    HitGate_SetRenderThreadId(static_cast<uint32_t>(GetCurrentThreadId()));
     FrameFence_Tick();    // <-- one tick per rendered frame
     RunScheduled(FrameFence_Id()); // your per-frame jobs if any
     return oEndScene(dev);
