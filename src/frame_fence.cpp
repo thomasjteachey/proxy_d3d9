@@ -15,6 +15,7 @@
 
 static volatile LONG g_frame = 0;
 static volatile LONG g_inited = 0;
+static volatile LONG g_renderTid = 0;
 
 void FrameFence_Init() {
     if (InterlockedCompareExchange(&g_inited, 1, 0) == 0) {
@@ -38,4 +39,12 @@ bool FrameFence_WaitNext(unsigned maxWaitMs) {
         Sleep(0); // yield without burning a full ms
     }
     return true;
+}
+
+void FrameFence_SetRenderThreadId(uint32_t tid) {
+    InterlockedCompareExchange(&g_renderTid, static_cast<LONG>(tid), 0);
+}
+
+uint32_t FrameFence_RenderThreadId() {
+    return static_cast<uint32_t>(InterlockedCompareExchange(&g_renderTid, 0, 0));
 }
