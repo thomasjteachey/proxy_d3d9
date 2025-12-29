@@ -110,25 +110,40 @@ static void __fastcall hkAttackerStateHandler(void* self, void* /*edx*/, void* p
 
 static void* ResolveAttackerStateHandler()
 {
-    // Pattern: 66 3D 4A 01 75 ?? E8 ?? ?? ?? ??
-    // cmp ax, 014A; jne short; call rel32
-    const uint8_t pat1[] = { 0x66, 0x3D, 0x4A, 0x01, 0x75, 0x00, 0xE8, 0, 0, 0, 0 };
-    const char* mask1 = "xxxxx?x????";
-    auto* hit = static_cast<uint8_t*>(FindPattern(pat1, mask1));
-    if (hit) {
-        int32_t rel = *reinterpret_cast<int32_t*>(hit + 7);
-        return hit + 11 + rel;
-    }
+    uint8_t* textBase = nullptr; size_t textSize = 0;
+    uint8_t* imageBase = nullptr; size_t imageSize = 0;
+    if (!GetTextRange(textBase, textSize) || !GetImageRange(imageBase, imageSize)) return nullptr;
 
-    // Alternate: 66 3D 4A 01 0F 85 ?? ?? ?? ?? E8 ?? ?? ?? ??
-    const uint8_t pat2[] = {
-        0x66, 0x3D, 0x4A, 0x01, 0x0F, 0x85, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0
-    };
-    const char* mask2 = "xxxxxx????x????";
-    hit = static_cast<uint8_t*>(FindPattern(pat2, mask2));
-    if (hit) {
-        int32_t rel = *reinterpret_cast<int32_t*>(hit + 11);
-        return hit + 15 + rel;
+    uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageBase);
+    uintptr_t imageEnd = imageStart + imageSize;
+    uintptr_t textStart = reinterpret_cast<uintptr_t>(textBase);
+    uintptr_t textEnd = textStart + textSize;
+
+    for (size_t i = 0; i + 7 <= textSize; ++i) {
+        const uint8_t* p = textBase + i;
+        if (p[0] != 0xFF) continue;
+        if (p[1] != 0x14 && p[1] != 0x24) continue;
+        if (p[2] != 0x85 && p[2] != 0x8D) continue;
+
+        uint32_t tableAddr = *reinterpret_cast<const uint32_t*>(p + 3);
+        if (tableAddr < imageStart || tableAddr + sizeof(uintptr_t) >= imageEnd) continue;
+
+        uintptr_t entryAddr = static_cast<uintptr_t>(tableAddr) + (0x14A * sizeof(uintptr_t));
+        if (entryAddr < imageStart || entryAddr + sizeof(uintptr_t) > imageEnd) continue;
+
+        uintptr_t fn = *reinterpret_cast<uintptr_t*>(entryAddr);
+        if (fn > 0x1000 && fn < imageSize) {
+            fn = imageStart + fn;
+        }
+
+        if (fn >= textStart && fn < textEnd) {
+            char line[128];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] 0x14A handler found: 0x%p",
+                reinterpret_cast<void*>(fn));
+            log_line(line);
+            return reinterpret_cast<void*>(fn);
+        }
     }
 
     return nullptr;

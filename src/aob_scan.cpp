@@ -29,6 +29,25 @@ static bool GetSectionRange(HMODULE mod, const char* name, uint8_t*& base, size_
     return false;
 }
 
+bool GetTextRange(uint8_t*& base, size_t& size)
+{
+    HMODULE mod = GetModuleHandleA(nullptr);
+    return GetSectionRange(mod, ".text", base, size);
+}
+
+bool GetImageRange(uint8_t*& base, size_t& size)
+{
+    HMODULE mod = GetModuleHandleA(nullptr);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>((uint8_t*)mod + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    base = reinterpret_cast<uint8_t*>(mod);
+    size = nt->OptionalHeader.SizeOfImage;
+    return true;
+}
+
 // 4-arg range scanner (what you already had)
 void* FindPattern(const uint8_t* pattern, const char* mask, void* start, size_t len) {
     auto* base = static_cast<uint8_t*>(start);
