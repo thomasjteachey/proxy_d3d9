@@ -11,3 +11,4 @@ void* FindPattern(const uint8_t* pattern, const char* mask, void* start, size_t 
 // PE helpers
 bool GetTextRange(uint8_t*& base, size_t& size);
 bool GetImageRange(uint8_t*& base, size_t& size);
+bool GetSectionRange(const char* name, uint8_t*& base, size_t& size);

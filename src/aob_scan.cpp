@@ -11,7 +11,7 @@ static bool Match(const uint8_t* p, const uint8_t* pat, const char* mask) {
 }
 
 // helper: get range of a PE section by name (e.g., ".text")
-static bool GetSectionRange(HMODULE mod, const char* name, uint8_t*& base, size_t& size) {
+static bool GetSectionRangeInternal(HMODULE mod, const char* name, uint8_t*& base, size_t& size) {
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
     if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>((uint8_t*)mod + dos->e_lfanew);
@@ -32,7 +32,7 @@ static bool GetSectionRange(HMODULE mod, const char* name, uint8_t*& base, size_
 bool GetTextRange(uint8_t*& base, size_t& size)
 {
     HMODULE mod = GetModuleHandleA(nullptr);
-    return GetSectionRange(mod, ".text", base, size);
+    return GetSectionRangeInternal(mod, ".text", base, size);
 }
 
 bool GetImageRange(uint8_t*& base, size_t& size)
@@ -46,6 +46,12 @@ bool GetImageRange(uint8_t*& base, size_t& size)
     base = reinterpret_cast<uint8_t*>(mod);
     size = nt->OptionalHeader.SizeOfImage;
     return true;
+}
+
+bool GetSectionRange(const char* name, uint8_t*& base, size_t& size)
+{
+    HMODULE mod = GetModuleHandleA(nullptr);
+    return GetSectionRangeInternal(mod, name, base, size);
 }
 
 // 4-arg range scanner (what you already had)
@@ -65,6 +71,6 @@ void* FindPattern(const uint8_t* pattern, const char* mask, void* start, size_t 
 void* FindPattern(const uint8_t* pattern, const char* mask) {
     HMODULE mod = GetModuleHandleA(nullptr);
     uint8_t* base = nullptr; size_t size = 0;
-    if (!GetSectionRange(mod, ".text", base, size)) return nullptr;
+    if (!GetSectionRangeInternal(mod, ".text", base, size)) return nullptr;
     return FindPattern(pattern, mask, base, size);
 }
