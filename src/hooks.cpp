@@ -113,8 +113,6 @@ static void __fastcall hkSVK_Any(void* self, void* /*edx*/, int a1, int a2)
     GetSectionRange(GetModuleHandleA(nullptr), ".text", textBase, textSize);
     uint8_t* ret = (uint8_t*)_ReturnAddress();   // return to the CALLER
     uint8_t* callerStart = FindFuncStart(ret, textBase);
-    uint8_t* handlerStart = HitGate_Get14AStart();
-    bool callerIn14A = handlerStart && ret >= handlerStart && ret < handlerStart + 0x1000;
 
     SVKStarter_t callOrig = nullptr;
     int active = gActiveIdx;
@@ -130,14 +128,11 @@ static void __fastcall hkSVK_Any(void* self, void* /*edx*/, int a1, int a2)
         dbgln(line);
     }
 
-    if (callOrig && !callerIn14A && HitGate_TryDeferSVK(self, a1, a2, callOrig)) {
+    if (callOrig && HitGate_TryDeferSVK(self, a1, a2, callOrig)) {
         return;
     }
 
     if (callOrig) {
-        if (callerIn14A) {
-            dbgln("[ClientFix][HitGate] SVK immediate (caller inside 0x14A)");
-        }
         __try { callOrig(self, a1, a2); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             dbgln("[ClientFix] SVK detour exception — disabling active hook");

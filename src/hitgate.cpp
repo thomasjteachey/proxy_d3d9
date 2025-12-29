@@ -5,8 +5,8 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 
-#include "MinHook.h"
 #include "aob_scan.h"
 #include "task_queue.h"
 #include "frame_fence.h"
@@ -16,8 +16,11 @@ static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA(
 static std::atomic<long> gHitGateOn{ 1 };
 static std::atomic<long> gBlockProcVisuals{ 0 };
 
-static void* g_Ori14A = nullptr;
-static uint8_t* g_14AStart = nullptr;
+static uint8_t* gDispatchCallsite = nullptr;
+static uint32_t gDispatchTableDisp = 0;
+static uint8_t* gDispatchRet = nullptr;
+static bool gDispatchUsesEcx = false;
+static uint8_t* gDispatchStub = nullptr;
 
 struct DeferredSVK {
     void* self;
@@ -28,6 +31,12 @@ struct DeferredSVK {
 
 static std::mutex gDeferredMx;
 static std::vector<DeferredSVK> gDeferredSVK;
+
+static void SafeCallSVK(void* self, int a1, int a2, SVKStarter_t orig)
+{
+    __try { orig(self, a1, a2); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
 static void HitGate_FlushDeferred()
 {
@@ -47,8 +56,7 @@ static void HitGate_FlushDeferred()
 
     for (const auto& entry : pending) {
         if (entry.orig) {
-            __try { entry.orig(entry.self, entry.a1, entry.a2); }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            SafeCallSVK(entry.self, entry.a1, entry.a2, entry.orig);
         }
     }
 }
@@ -93,35 +101,74 @@ bool HitGate_IsEnabled()
     return gHitGateOn.load() != 0;
 }
 
-uint8_t* HitGate_Get14AStart()
+// -------------------- dispatch callsite hook --------------------
+static void __cdecl OnDispatchEnter(uint32_t opcode)
 {
-    return g_14AStart;
-}
-
-// -------------------- 0x14A handler hook --------------------
-static void __cdecl On14AEnter()
-{
-    log_line("[ClientFix][HitGate] On14AEnter() fired");
+    if (opcode != 0x14A) return;
+    log_line("[ClientFix][HitGate] HitGate armed (opcode 0x14A)");
     HitGate_ArmOneFrame();
 }
 
-extern "C" void __declspec(naked) hk14A()
+static uint8_t* BuildDispatchStub(bool usesEcx, uint32_t tableDisp, uint8_t* retaddr)
 {
-    __asm {
-        pushfd
-        pushad
-        call On14AEnter
-        popad
-        popfd
-        jmp dword ptr [g_Ori14A]
+    std::vector<uint8_t> code;
+    auto emit = [&code](uint8_t b) { code.push_back(b); };
+    auto emit32 = [&code](uint32_t v) {
+        code.push_back(static_cast<uint8_t>(v));
+        code.push_back(static_cast<uint8_t>(v >> 8));
+        code.push_back(static_cast<uint8_t>(v >> 16));
+        code.push_back(static_cast<uint8_t>(v >> 24));
+    };
+
+    emit(0x9C); // pushfd
+    emit(0x60); // pushad
+    emit(usesEcx ? 0x51 : 0x50); // push ecx/eax
+    emit(0xE8); // call rel32
+    size_t callRelPos = code.size();
+    emit32(0);
+    emit(0x83); emit(0xC4); emit(0x04); // add esp, 4
+    emit(0x61); // popad
+    emit(0x9D); // popfd
+    emit(0xFF); emit(0x14); emit(usesEcx ? 0x8D : 0x85); // call [reg*4 + disp32]
+    size_t dispPos = code.size();
+    emit32(tableDisp);
+    emit(0xE9); // jmp rel32
+    size_t jmpRelPos = code.size();
+    emit32(0);
+
+    uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, code.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) return nullptr;
+
+    std::memcpy(stub, code.data(), code.size());
+
+    int32_t callRel = reinterpret_cast<uint8_t*>(&OnDispatchEnter) -
+        (stub + callRelPos + sizeof(int32_t));
+    std::memcpy(stub + callRelPos, &callRel, sizeof(callRel));
+
+    int32_t jmpRel = retaddr - (stub + jmpRelPos + sizeof(int32_t));
+    std::memcpy(stub + jmpRelPos, &jmpRel, sizeof(jmpRel));
+
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    return stub;
+}
+
+static bool ReadPtr(uintptr_t addr, uintptr_t& out)
+{
+    __try {
+        out = *reinterpret_cast<uintptr_t*>(addr);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 
-static void* ResolveAttackerStateHandler()
+static bool FindDispatchCallsite()
 {
     uint8_t* textBase = nullptr; size_t textSize = 0;
     uint8_t* imageBase = nullptr; size_t imageSize = 0;
-    if (!GetTextRange(textBase, textSize) || !GetImageRange(imageBase, imageSize)) return nullptr;
+    if (!GetTextRange(textBase, textSize) || !GetImageRange(imageBase, imageSize)) return false;
 
     uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageBase);
     uintptr_t imageEnd = imageStart + imageSize;
@@ -140,82 +187,58 @@ static void* ResolveAttackerStateHandler()
         uintptr_t entryAddr = static_cast<uintptr_t>(tableAddr) + (0x14A * sizeof(uintptr_t));
         if (entryAddr < imageStart || entryAddr + sizeof(uintptr_t) > imageEnd) continue;
 
-        uintptr_t fn = *reinterpret_cast<uintptr_t*>(entryAddr);
+        uintptr_t fn = 0;
+        if (!ReadPtr(entryAddr, fn)) continue;
         if (fn > 0x1000 && fn < imageSize) {
             fn = imageStart + fn;
         }
 
         if (fn >= textStart && fn < textEnd) {
-            char line[128];
-            std::snprintf(line, sizeof(line),
-                "[ClientFix][HitGate] 0x14A handler found: 0x%p",
-                reinterpret_cast<void*>(fn));
-            log_line(line);
-            return reinterpret_cast<void*>(fn);
+            gDispatchCallsite = const_cast<uint8_t*>(p);
+            gDispatchTableDisp = tableAddr;
+            gDispatchRet = gDispatchCallsite + 7;
+            gDispatchUsesEcx = (p[2] == 0x8D);
+            return true;
         }
     }
 
-    return nullptr;
-}
-
-static bool IsPlausibleHookTarget(void* target)
-{
-    uint8_t* textBase = nullptr; size_t textSize = 0;
-    if (!GetTextRange(textBase, textSize)) {
-        log_line("[ClientFix][HitGate] .text range not found");
-        return false;
-    }
-
-    auto* ptr = reinterpret_cast<uint8_t*>(target);
-    if (ptr < textBase || ptr >= textBase + textSize) {
-        log_line("[ClientFix][HitGate] 0x14A handler target not in .text");
-        return false;
-    }
-
-    uint8_t first = 0;
-    __try { first = *ptr; }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        log_line("[ClientFix][HitGate] 0x14A handler target unreadable");
-        return false;
-    }
-
-    switch (first) {
-    case 0x55: // push ebp
-    case 0x53: // push ebx
-    case 0x56: // push esi
-    case 0x57: // push edi
-        return true;
-    default:
-        break;
-    }
-
-    char line[128];
-    std::snprintf(line, sizeof(line),
-        "[ClientFix][HitGate] 0x14A handler target byte not plausible: 0x%02X",
-        first);
-    log_line(line);
     return false;
 }
 
 void HitGate_Init()
 {
-    void* target = ResolveAttackerStateHandler();
-    if (!target) {
-        log_line("[ClientFix][HitGate] 0x14A handler not found");
+    if (!FindDispatchCallsite()) {
+        log_line("[ClientFix][HitGate] dispatch callsite not found");
         return;
     }
 
-    if (!IsPlausibleHookTarget(target)) {
-        log_line("[ClientFix][HitGate] 0x14A handler hook skipped (invalid target)");
+    gDispatchStub = BuildDispatchStub(gDispatchUsesEcx, gDispatchTableDisp, gDispatchRet);
+    if (!gDispatchStub) {
+        log_line("[ClientFix][HitGate] dispatch stub alloc failed");
         return;
     }
 
-    if (MH_CreateHook(target, &hk14A, &g_Ori14A) == MH_OK &&
-        MH_EnableHook(target) == MH_OK) {
-        g_14AStart = static_cast<uint8_t*>(target);
-        log_line("[ClientFix][HitGate] 0x14A handler hook installed (naked)");
+    DWORD oldProt = 0;
+    if (!VirtualProtect(gDispatchCallsite, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        log_line("[ClientFix][HitGate] dispatch callsite protect failed");
+        return;
     }
-    else {
-        log_line("[ClientFix][HitGate] 0x14A handler hook FAILED");
+
+    int32_t rel = gDispatchStub - (gDispatchCallsite + 5);
+    gDispatchCallsite[0] = 0xE8;
+    std::memcpy(gDispatchCallsite + 1, &rel, sizeof(rel));
+    gDispatchCallsite[5] = 0x90;
+    gDispatchCallsite[6] = 0x90;
+
+    DWORD ignore = 0;
+    VirtualProtect(gDispatchCallsite, 7, oldProt, &ignore);
+    FlushInstructionCache(GetCurrentProcess(), gDispatchCallsite, 7);
+
+    {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] Dispatch callsite hook installed @ 0x%p index=%s table=0x%08X",
+            gDispatchCallsite, gDispatchUsesEcx ? "ECX" : "EAX", gDispatchTableDisp);
+        log_line(line);
     }
 }
