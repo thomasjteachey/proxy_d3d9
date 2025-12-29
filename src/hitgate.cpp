@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <array>
+#include <algorithm>
 
 #include "aob_scan.h"
 #include "task_queue.h"
@@ -42,6 +44,7 @@ static std::atomic<uint32_t> gLastOpcode{ 0 };
 static std::atomic<uint32_t> gLastTid{ 0 };
 static std::atomic<uint32_t> gSaw14A{ 0 };
 static std::atomic<uint32_t> gSaw14ATid{ 0 };
+static std::array<std::atomic<uint32_t>, 0x300> gOpcodeHitCounts{};
 
 static uint8_t* gDispatchCallsite = nullptr;
 static uint32_t gDispatchTableDisp = 0;
@@ -53,7 +56,6 @@ static int gDispatchScore = 0;
 
 static uintptr_t gOpcodeTable = 0;
 static int gOpcodeTableScore = 0;
-static void* gOrig14A = nullptr;
 
 static void MaybeLogThreadIds();
 
@@ -119,17 +121,25 @@ static void __cdecl OnOpcode14AHit()
     gSaw14ATid.store(GetCurrentThreadId(), std::memory_order_relaxed);
 }
 
-extern "C" __declspec(naked) void My14AWrapper()
+static void __cdecl OnOpcodeProbeHit(uint32_t opcode)
 {
-    __asm {
-        pushfd
-        pushad
+    gDispatchHits.fetch_add(1, std::memory_order_relaxed);
+    gLastOpcode.store(opcode, std::memory_order_relaxed);
+    gLastTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+
+    if (opcode == 0x14A) {
+        OnOpcode14AHit();
     }
-    OnOpcode14AHit();
-    __asm {
-        popad
-        popfd
-        jmp dword ptr [gOrig14A]
+
+    if (opcode < gOpcodeHitCounts.size()) {
+        uint32_t count = gOpcodeHitCounts[opcode].fetch_add(1, std::memory_order_relaxed);
+        if (count < 5) {
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] opcode hit opcode=0x%X count=%u",
+                opcode, count + 1);
+            log_line(line);
+        }
     }
 }
 
@@ -342,6 +352,60 @@ static bool PtrInRange(uintptr_t ptr, uintptr_t start, uintptr_t end)
     return ptr >= start && ptr < end;
 }
 
+enum class TableEncoding {
+    Unknown,
+    VA,
+    RVA
+};
+
+static TableEncoding DetectTableEncoding(uintptr_t tableAddr, uintptr_t imageStart, uintptr_t imageEnd,
+    int& vaHits, int& rvaHits)
+{
+    vaHits = 0;
+    rvaHits = 0;
+    constexpr size_t entryCount = 512;
+    constexpr int samples = 64;
+    size_t step = entryCount / samples;
+    if (step == 0) step = 1;
+
+    for (int i = 0; i < samples; ++i) {
+        size_t idx = static_cast<size_t>(i) * step;
+        if (idx >= entryCount) idx = entryCount - 1;
+        uintptr_t entry = 0;
+        if (!ReadPtr(tableAddr + (idx * sizeof(uintptr_t)), entry)) continue;
+        uintptr_t rawPtr = static_cast<uint32_t>(entry);
+        if (PtrInRange(rawPtr, imageStart, imageEnd)) ++vaHits;
+        uintptr_t rvaVa = imageStart + rawPtr;
+        if (PtrInRange(rvaVa, imageStart, imageEnd)) ++rvaHits;
+    }
+
+    if (vaHits == 0 && rvaHits == 0) return TableEncoding::Unknown;
+    return (rvaHits > vaHits) ? TableEncoding::RVA : TableEncoding::VA;
+}
+
+static bool ResolveEntryByEncoding(uint32_t raw, TableEncoding encoding, uintptr_t imageStart,
+    uintptr_t imageEnd, uintptr_t& outVa)
+{
+    if (encoding == TableEncoding::RVA) {
+        uintptr_t va = imageStart + static_cast<uintptr_t>(raw);
+        if (PtrInRange(va, imageStart, imageEnd)) {
+            outVa = va;
+            return true;
+        }
+        return false;
+    }
+    if (encoding == TableEncoding::VA) {
+        uintptr_t va = static_cast<uintptr_t>(raw);
+        if (PtrInRange(va, imageStart, imageEnd)) {
+            outVa = va;
+            return true;
+        }
+        return false;
+    }
+
+    return ResolveTableEntryVA(raw, imageStart, imageEnd, outVa);
+}
+
 static bool FindOpcodeTable(uintptr_t& outTable, int& outScore)
 {
     uint8_t* textBase = nullptr; size_t textSize = 0;
@@ -437,38 +501,46 @@ static void LogOpcodeTable(uintptr_t tableAddr, int score)
     }
 }
 
-static bool PatchOpcode14A(uintptr_t tableAddr)
+static uint8_t* BuildOpcodeWrapperStub(uint32_t opcode, uintptr_t origHandler)
 {
-    uint8_t* imageBase = nullptr; size_t imageSize = 0;
-    if (!GetImageRange(imageBase, imageSize)) return false;
-    uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageBase);
-    uintptr_t imageEnd = imageStart + imageSize;
+    std::vector<uint8_t> code;
+    auto emit = [&code](uint8_t b) { code.push_back(b); };
+    auto emit32 = [&code](uint32_t v) {
+        code.push_back(static_cast<uint8_t>(v));
+        code.push_back(static_cast<uint8_t>(v >> 8));
+        code.push_back(static_cast<uint8_t>(v >> 16));
+        code.push_back(static_cast<uint8_t>(v >> 24));
+    };
 
-    uintptr_t entryAddr = tableAddr + (0x14A * sizeof(uintptr_t));
-    uintptr_t entry = 0;
-    if (!ReadPtr(entryAddr, entry)) return false;
+    emit(0x9C); // pushfd
+    emit(0x60); // pushad
+    emit(0x68); // push imm32
+    emit32(opcode);
+    emit(0xE8); // call rel32
+    size_t callRelPos = code.size();
+    emit32(0);
+    emit(0x83); emit(0xC4); emit(0x04); // add esp, 4
+    emit(0x61); // popad
+    emit(0x9D); // popfd
+    emit(0xB8); // mov eax, imm32
+    emit32(static_cast<uint32_t>(origHandler));
+    emit(0xFF); emit(0xE0); // jmp eax
 
-    uintptr_t handlerVa = 0;
-    uint32_t rawEntry = static_cast<uint32_t>(entry);
-    if (!ResolveTableEntryVA(rawEntry, imageStart, imageEnd, handlerVa)) {
-        char line[200];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] table[0x14A]=0x%08X not VA/RVA in image; abort",
-            rawEntry);
-        log_line(line);
-        return false;
-    }
+    uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, code.size(),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) return nullptr;
 
-    {
-        char line[200];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] table[0x14A] raw=0x%08X -> handlerVA=0x%08X (base=0x%p)",
-            rawEntry, static_cast<uint32_t>(handlerVa), reinterpret_cast<void*>(imageStart));
-        log_line(line);
-    }
+    std::memcpy(stub, code.data(), code.size());
+    int32_t callRel = reinterpret_cast<uint8_t*>(&OnOpcodeProbeHit) -
+        (stub + callRelPos + sizeof(int32_t));
+    std::memcpy(stub + callRelPos, &callRel, sizeof(callRel));
 
-    gOrig14A = reinterpret_cast<void*>(handlerVa);
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    return stub;
+}
 
+static bool WriteTableEntry(uintptr_t entryAddr, uint32_t rawValue)
+{
     DWORD oldProt = 0;
     if (!VirtualProtect(reinterpret_cast<void*>(entryAddr), sizeof(uintptr_t), PAGE_READWRITE, &oldProt)) {
         char line[160];
@@ -479,18 +551,97 @@ static bool PatchOpcode14A(uintptr_t tableAddr)
         return false;
     }
 
-    *reinterpret_cast<uintptr_t*>(entryAddr) = reinterpret_cast<uintptr_t>(&My14AWrapper);
+    *reinterpret_cast<uint32_t*>(entryAddr) = rawValue;
 
     DWORD ignore = 0;
     VirtualProtect(reinterpret_cast<void*>(entryAddr), sizeof(uintptr_t), oldProt, &ignore);
     FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(entryAddr), sizeof(uintptr_t));
+    return true;
+}
 
-    char line[200];
-    std::snprintf(line, sizeof(line),
-        "[ClientFix][HitGate] patched table[0x14A] orig=0x%08X wrapper=0x%08X",
-        static_cast<uint32_t>(handlerVa),
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&My14AWrapper)));
-    log_line(line);
+static void AppendProbeRange(std::vector<uint16_t>& opcodes, uint16_t start, uint16_t end, size_t maxCount)
+{
+    if (start > end || maxCount == 0) return;
+    size_t length = static_cast<size_t>(end - start + 1);
+    size_t step = length / maxCount;
+    if (step == 0) step = 1;
+    size_t added = 0;
+    for (uint16_t op = start; op <= end && added < maxCount; op = static_cast<uint16_t>(op + step)) {
+        opcodes.push_back(op);
+        ++added;
+        if (end - op < step) break;
+    }
+}
+
+static bool PatchOpcodeTableProbes(uintptr_t tableAddr)
+{
+    uint8_t* imageBase = nullptr; size_t imageSize = 0;
+    if (!GetImageRange(imageBase, imageSize)) return false;
+    uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageBase);
+    uintptr_t imageEnd = imageStart + imageSize;
+
+    int vaHits = 0;
+    int rvaHits = 0;
+    TableEncoding encoding = DetectTableEncoding(tableAddr, imageStart, imageEnd, vaHits, rvaHits);
+
+    {
+        char line[200];
+        const char* mode = (encoding == TableEncoding::RVA) ? "RVA" :
+            (encoding == TableEncoding::VA) ? "VA" : "UNKNOWN";
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] tableEncoding=%s vaHits=%d rvaHits=%d",
+            mode, vaHits, rvaHits);
+        log_line(line);
+    }
+
+    std::vector<uint16_t> opcodes;
+    opcodes.reserve(64);
+    AppendProbeRange(opcodes, 0x140, 0x170, 16);
+    AppendProbeRange(opcodes, 0x1A0, 0x1D0, 16);
+    AppendProbeRange(opcodes, 0x200, 0x240, 16);
+    opcodes.push_back(0x14A);
+    std::sort(opcodes.begin(), opcodes.end());
+    opcodes.erase(std::unique(opcodes.begin(), opcodes.end()), opcodes.end());
+
+    for (uint16_t opcode : opcodes) {
+        uintptr_t entryAddr = tableAddr + (opcode * sizeof(uintptr_t));
+        uintptr_t entry = 0;
+        if (!ReadPtr(entryAddr, entry)) continue;
+
+        uint32_t rawEntry = static_cast<uint32_t>(entry);
+        uintptr_t handlerVa = 0;
+        if (!ResolveEntryByEncoding(rawEntry, encoding, imageStart, imageEnd, handlerVa)) {
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] table[0x%X]=0x%08X not VA/RVA in image; skip",
+                opcode, rawEntry);
+            log_line(line);
+            continue;
+        }
+
+        uint8_t* stub = BuildOpcodeWrapperStub(opcode, handlerVa);
+        if (!stub) continue;
+
+        uint32_t patchedRaw = (encoding == TableEncoding::RVA)
+            ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(stub) - imageStart)
+            : static_cast<uint32_t>(reinterpret_cast<uintptr_t>(stub));
+
+        if (!WriteTableEntry(entryAddr, patchedRaw)) continue;
+
+        if (opcode == 0x14A) {
+            uintptr_t readbackEntry = 0;
+            uintptr_t resolved = 0;
+            ReadPtr(entryAddr, readbackEntry);
+            ResolveEntryByEncoding(static_cast<uint32_t>(readbackEntry), encoding, imageStart, imageEnd, resolved);
+            char line[240];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] patched table[0x14A] raw=0x%08X resolvedVA=0x%08X",
+                static_cast<uint32_t>(readbackEntry),
+                static_cast<uint32_t>(resolved));
+            log_line(line);
+        }
+    }
+
     return true;
 }
 
@@ -610,7 +761,7 @@ void HitGate_Init()
         gOpcodeTable = opcodeTable;
         gOpcodeTableScore = opcodeScore;
         LogOpcodeTable(opcodeTable, opcodeScore);
-        PatchOpcode14A(opcodeTable);
+        PatchOpcodeTableProbes(opcodeTable);
     } else {
         log_line("[ClientFix][HitGate] opcode handler table not found");
     }
