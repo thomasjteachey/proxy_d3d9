@@ -45,7 +45,8 @@ static std::atomic<uint32_t> gSaw14A{ 0 };
 static uint8_t* gDispatchCallsite = nullptr;
 static uint32_t gDispatchTableDisp = 0;
 static uint8_t* gDispatchRet = nullptr;
-static bool gDispatchUsesEcx = false;
+static uint8_t gDispatchSib = 0;
+static uint8_t gDispatchIndexReg = 0;
 static uint8_t* gDispatchStub = nullptr;
 static int gDispatchScore = 0;
 
@@ -233,7 +234,7 @@ static void __cdecl OnDispatchEnter(uint32_t opcode)
     }
 }
 
-static uint8_t* BuildDispatchStub(bool usesEcx, uint32_t tableDisp, uint8_t* retaddr)
+static uint8_t* BuildDispatchStub(uint8_t sib, uint32_t tableDisp, uint8_t* retaddr, uint8_t indexRegId)
 {
     std::vector<uint8_t> code;
     auto emit = [&code](uint8_t b) { code.push_back(b); };
@@ -246,14 +247,14 @@ static uint8_t* BuildDispatchStub(bool usesEcx, uint32_t tableDisp, uint8_t* ret
 
     emit(0x9C); // pushfd
     emit(0x60); // pushad
-    emit(usesEcx ? 0x51 : 0x50); // push ecx/eax
+    emit(static_cast<uint8_t>(0x50 + indexRegId)); // push <index-reg>
     emit(0xE8); // call rel32
     size_t callRelPos = code.size();
     emit32(0);
     emit(0x83); emit(0xC4); emit(0x04); // add esp, 4
     emit(0x61); // popad
     emit(0x9D); // popfd
-    emit(0xFF); emit(0x14); emit(usesEcx ? 0x8D : 0x85); // call [reg*4 + disp32]
+    emit(0xFF); emit(0x14); emit(sib); // call [reg*4 + disp32]
     size_t dispPos = code.size();
     emit32(tableDisp);
     emit(0xE9); // jmp rel32
@@ -309,14 +310,20 @@ static bool FindDispatchCallsite()
     int bestScore = -1;
     uint8_t* bestSite = nullptr;
     uint32_t bestTable = 0;
-    bool bestUsesEcx = false;
+    uint8_t bestSib = 0;
+    uint8_t bestIndexReg = 0;
     int candidates = 0;
 
     for (size_t i = 0; i + 7 <= textSize; ++i) {
         const uint8_t* p = textBase + i;
         if (p[0] != 0xFF) continue;
         if (p[1] != 0x14) continue;
-        if (p[2] != 0x85 && p[2] != 0x8D) continue;
+        uint8_t sib = p[2];
+        bool scale4 = (sib & 0xC0) == 0x80;
+        bool baseNone = (sib & 0x07) == 0x05;
+        uint8_t idx = (sib >> 3) & 0x07;
+        bool idxOk = (idx != 4);
+        if (!(scale4 && baseNone && idxOk)) continue;
 
         ++candidates;
         uint32_t tableAddr = *reinterpret_cast<const uint32_t*>(p + 3);
@@ -346,7 +353,8 @@ static bool FindDispatchCallsite()
             bestScore = score;
             bestSite = const_cast<uint8_t*>(p);
             bestTable = tableAddr;
-            bestUsesEcx = (p[2] == 0x8D);
+            bestSib = sib;
+            bestIndexReg = idx;
         }
     }
 
@@ -363,7 +371,8 @@ static bool FindDispatchCallsite()
     gDispatchCallsite = bestSite;
     gDispatchTableDisp = bestTable;
     gDispatchRet = gDispatchCallsite + 7;
-    gDispatchUsesEcx = bestUsesEcx;
+    gDispatchSib = bestSib;
+    gDispatchIndexReg = bestIndexReg;
     gDispatchScore = bestScore;
     return true;
 }
@@ -375,15 +384,28 @@ void HitGate_Init()
         return;
     }
 
+    auto index_reg_name = [](uint8_t regId) {
+        switch (regId) {
+        case 0: return "EAX";
+        case 1: return "ECX";
+        case 2: return "EDX";
+        case 3: return "EBX";
+        case 5: return "EBP";
+        case 6: return "ESI";
+        case 7: return "EDI";
+        default: return "UNKNOWN";
+        }
+    };
     {
-        char line[200];
+        char line[220];
         std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] dispatch selected callsite=0x%p index=%s table=0x%08X score=%d",
-            gDispatchCallsite, gDispatchUsesEcx ? "ECX" : "EAX", gDispatchTableDisp, gDispatchScore);
+            "[ClientFix][HitGate] dispatch selected callsite=0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
+            gDispatchCallsite, gDispatchSib, index_reg_name(gDispatchIndexReg),
+            gDispatchTableDisp, gDispatchScore);
         log_line(line);
     }
 
-    gDispatchStub = BuildDispatchStub(gDispatchUsesEcx, gDispatchTableDisp, gDispatchRet);
+    gDispatchStub = BuildDispatchStub(gDispatchSib, gDispatchTableDisp, gDispatchRet, gDispatchIndexReg);
     if (!gDispatchStub) {
         log_line("[ClientFix][HitGate] dispatch stub alloc failed");
         return;
@@ -430,10 +452,11 @@ void HitGate_Init()
     }
 
     {
-        char line[160];
+        char line[200];
         std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] Dispatch callsite hook installed @ 0x%p index=%s table=0x%08X score=%d",
-            gDispatchCallsite, gDispatchUsesEcx ? "ECX" : "EAX", gDispatchTableDisp, gDispatchScore);
+            "[ClientFix][HitGate] Dispatch callsite hook installed @ 0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
+            gDispatchCallsite, gDispatchSib, index_reg_name(gDispatchIndexReg),
+            gDispatchTableDisp, gDispatchScore);
         log_line(line);
     }
 
