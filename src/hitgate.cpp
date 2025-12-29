@@ -12,6 +12,19 @@
 #include "frame_fence.h"
 
 static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA("\n"); }
+static void BytesToString(const uint8_t* bytes, size_t count, char* out, size_t outSize)
+{
+    size_t pos = 0;
+    for (size_t i = 0; i < count && pos + 3 < outSize; ++i) {
+        int wrote = std::snprintf(out + pos, outSize - pos, "%02X", bytes[i]);
+        if (wrote < 0) break;
+        pos += static_cast<size_t>(wrote);
+        if (i + 1 < count && pos + 2 < outSize) {
+            out[pos++] = ' ';
+            out[pos] = '\0';
+        }
+    }
+}
 
 static std::atomic<long> gHitGateOn{ 1 };
 static std::atomic<long> gBlockProcVisuals{ 0 };
@@ -362,6 +375,14 @@ void HitGate_Init()
         return;
     }
 
+    {
+        char line[200];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] dispatch selected callsite=0x%p index=%s table=0x%08X score=%d",
+            gDispatchCallsite, gDispatchUsesEcx ? "ECX" : "EAX", gDispatchTableDisp, gDispatchScore);
+        log_line(line);
+    }
+
     gDispatchStub = BuildDispatchStub(gDispatchUsesEcx, gDispatchTableDisp, gDispatchRet);
     if (!gDispatchStub) {
         log_line("[ClientFix][HitGate] dispatch stub alloc failed");
@@ -370,9 +391,16 @@ void HitGate_Init()
 
     DWORD oldProt = 0;
     if (!VirtualProtect(gDispatchCallsite, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        log_line("[ClientFix][HitGate] dispatch callsite protect failed");
+        char line[160];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] dispatch callsite protect failed err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        log_line(line);
         return;
     }
+
+    uint8_t before[8] = {};
+    std::memcpy(before, gDispatchCallsite, sizeof(before));
 
     int32_t rel = gDispatchStub - (gDispatchCallsite + 5);
     gDispatchCallsite[0] = 0xE8;
@@ -383,6 +411,23 @@ void HitGate_Init()
     DWORD ignore = 0;
     VirtualProtect(gDispatchCallsite, 7, oldProt, &ignore);
     FlushInstructionCache(GetCurrentProcess(), gDispatchCallsite, 7);
+
+    uint8_t after[8] = {};
+    std::memcpy(after, gDispatchCallsite, sizeof(after));
+    char beforeText[64] = {};
+    char afterText[64] = {};
+    BytesToString(before, sizeof(before), beforeText, sizeof(beforeText));
+    BytesToString(after, sizeof(after), afterText, sizeof(afterText));
+    {
+        char line[220];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] dispatch callsite bytes BEFORE=%s AFTER=%s",
+            beforeText, afterText);
+        log_line(line);
+    }
+    if (std::memcmp(before, after, sizeof(before)) == 0) {
+        log_line("[ClientFix][HitGate] dispatch callsite bytes unchanged after patch");
+    }
 
     {
         char line[160];

@@ -173,10 +173,50 @@ static void DiscoverSVKLoader()
 // ------------------------- Install all (called once) ------------------
 static bool gCombatHooksInstalled = false;
 
+static bool IsWowProcess()
+{
+    char path[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(nullptr, path, static_cast<DWORD>(sizeof(path)));
+    const char* exe = path;
+    if (len == 0) {
+        exe = "";
+    } else {
+        const char* lastSlash = strrchr(path, '\\');
+        const char* lastFwd = strrchr(path, '/');
+        const char* last = lastSlash ? lastSlash : lastFwd;
+        if (lastFwd && lastSlash) {
+            last = (lastFwd > lastSlash) ? lastFwd : lastSlash;
+        } else if (lastFwd) {
+            last = lastFwd;
+        }
+        if (last && *(last + 1) != '\0') {
+            exe = last + 1;
+        }
+    }
+
+    char line[512];
+    std::snprintf(line, sizeof(line),
+        "[ClientFix][HitGate] PID=%lu EXE=%s",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        path[0] ? path : "(unknown)");
+    dbgln(line);
+
+    if (_stricmp(exe, "Wow.exe") != 0) {
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] Not Wow.exe (%s), skipping combat hooks",
+            exe[0] ? exe : "(unknown)");
+        dbgln(line);
+        return false;
+    }
+    return true;
+}
+
 void InstallCombatHooks()
 {
     if (gCombatHooksInstalled) return;
     gCombatHooksInstalled = true;
+
+    if (!IsWowProcess()) return;
 
     DiscoverSVKLoader();
     if (gSVKLoaderStart && !gSVKHookArmed) {
