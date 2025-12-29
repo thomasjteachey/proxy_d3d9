@@ -4,6 +4,7 @@
 #include <vector>
 #include <mutex>
 #include <cstdio>
+#include <cstdint>
 
 #include "MinHook.h"
 #include "aob_scan.h"
@@ -14,7 +15,9 @@ static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA(
 
 static std::atomic<long> gHitGateOn{ 1 };
 static std::atomic<long> gBlockProcVisuals{ 0 };
-static thread_local int tls_in14a = 0;
+
+static void* g_Ori14A = nullptr;
+static uint8_t* g_14AStart = nullptr;
 
 struct DeferredSVK {
     void* self;
@@ -44,7 +47,8 @@ static void HitGate_FlushDeferred()
 
     for (const auto& entry : pending) {
         if (entry.orig) {
-            entry.orig(entry.self, entry.a1, entry.a2);
+            __try { entry.orig(entry.self, entry.a1, entry.a2); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
     }
 }
@@ -69,10 +73,6 @@ void HitGate_ArmOneFrame()
 bool HitGate_TryDeferSVK(void* self, int a1, int a2, SVKStarter_t orig)
 {
     if (!HitGate_IsEnabled()) return false;
-    if (tls_in14a > 0) {
-        log_line("[ClientFix][HitGate] SVK immediate (tls_in14a)");
-        return false;
-    }
     if (gBlockProcVisuals.load() == 0) return false;
 
     {
@@ -93,19 +93,28 @@ bool HitGate_IsEnabled()
     return gHitGateOn.load() != 0;
 }
 
-// -------------------- 0x14A handler hook --------------------
-using AttackerStateHandler_t = void(__thiscall*)(void* self, void* pkt);
-static AttackerStateHandler_t gAttackerStateHandler = nullptr;
-
-static void __fastcall hkAttackerStateHandler(void* self, void* /*edx*/, void* pkt)
+uint8_t* HitGate_Get14AStart()
 {
-    ++tls_in14a;
-    log_line("[ClientFix][HitGate] attackerstate handler hit");
-    if (gAttackerStateHandler) {
-        gAttackerStateHandler(self, pkt);
-    }
+    return g_14AStart;
+}
+
+// -------------------- 0x14A handler hook --------------------
+static void __cdecl On14AEnter()
+{
+    log_line("[ClientFix][HitGate] On14AEnter() fired");
     HitGate_ArmOneFrame();
-    --tls_in14a;
+}
+
+extern "C" void __declspec(naked) hk14A()
+{
+    __asm {
+        pushfd
+        pushad
+        call On14AEnter
+        popad
+        popfd
+        jmp dword ptr [g_Ori14A]
+    }
 }
 
 static void* ResolveAttackerStateHandler()
@@ -149,6 +158,45 @@ static void* ResolveAttackerStateHandler()
     return nullptr;
 }
 
+static bool IsPlausibleHookTarget(void* target)
+{
+    uint8_t* textBase = nullptr; size_t textSize = 0;
+    if (!GetTextRange(textBase, textSize)) {
+        log_line("[ClientFix][HitGate] .text range not found");
+        return false;
+    }
+
+    auto* ptr = reinterpret_cast<uint8_t*>(target);
+    if (ptr < textBase || ptr >= textBase + textSize) {
+        log_line("[ClientFix][HitGate] 0x14A handler target not in .text");
+        return false;
+    }
+
+    uint8_t first = 0;
+    __try { first = *ptr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_line("[ClientFix][HitGate] 0x14A handler target unreadable");
+        return false;
+    }
+
+    switch (first) {
+    case 0x55: // push ebp
+    case 0x53: // push ebx
+    case 0x56: // push esi
+    case 0x57: // push edi
+        return true;
+    default:
+        break;
+    }
+
+    char line[128];
+    std::snprintf(line, sizeof(line),
+        "[ClientFix][HitGate] 0x14A handler target byte not plausible: 0x%02X",
+        first);
+    log_line(line);
+    return false;
+}
+
 void HitGate_Init()
 {
     void* target = ResolveAttackerStateHandler();
@@ -157,9 +205,15 @@ void HitGate_Init()
         return;
     }
 
-    if (MH_CreateHook(target, &hkAttackerStateHandler, reinterpret_cast<void**>(&gAttackerStateHandler)) == MH_OK &&
+    if (!IsPlausibleHookTarget(target)) {
+        log_line("[ClientFix][HitGate] 0x14A handler hook skipped (invalid target)");
+        return;
+    }
+
+    if (MH_CreateHook(target, &hk14A, &g_Ori14A) == MH_OK &&
         MH_EnableHook(target) == MH_OK) {
-        log_line("[ClientFix][HitGate] 0x14A handler hook installed");
+        g_14AStart = static_cast<uint8_t*>(target);
+        log_line("[ClientFix][HitGate] 0x14A handler hook installed (naked)");
     }
     else {
         log_line("[ClientFix][HitGate] 0x14A handler hook FAILED");
