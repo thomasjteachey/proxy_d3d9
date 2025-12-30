@@ -338,6 +338,8 @@ static bool ReadPtr(uintptr_t addr, uintptr_t& out)
 
 static uintptr_t NormalizePtr(uintptr_t ptr, uintptr_t imageStart, size_t imageSize)
 {
+    uintptr_t imageEnd = imageStart + imageSize;
+    if (ptr >= imageStart && ptr < imageEnd) return ptr;
     if (ptr > 0x1000 && ptr < imageSize) return imageStart + ptr;
     return ptr;
 }
@@ -803,8 +805,7 @@ static bool FindDispatchCallsite()
     uintptr_t textStart = reinterpret_cast<uintptr_t>(textBase);
     uintptr_t textEnd = textStart + textSize;
     auto normalize_ptr = [&](uintptr_t ptr) -> uintptr_t {
-        if (ptr > 0x1000 && ptr < imageSize) return imageStart + ptr;
-        return ptr;
+        return NormalizePtr(ptr, imageStart, imageSize);
     };
     auto ptr_in_text = [&](uintptr_t ptr) -> bool {
         return ptr >= textStart && ptr < textEnd;
@@ -948,99 +949,98 @@ void HitGate_Init()
 
     if (!FindDispatchCallsite()) {
         log_line("[ClientFix][HitGate] dispatch callsite not found");
-        return;
-    }
-
-    auto index_reg_name = [](uint8_t regId) {
-        switch (regId) {
-        case 0: return "EAX";
-        case 1: return "ECX";
-        case 2: return "EDX";
-        case 3: return "EBX";
-        case 5: return "EBP";
-        case 6: return "ESI";
-        case 7: return "EDI";
-        default: return "UNKNOWN";
+    } else {
+        auto index_reg_name = [](uint8_t regId) {
+            switch (regId) {
+            case 0: return "EAX";
+            case 1: return "ECX";
+            case 2: return "EDX";
+            case 3: return "EBX";
+            case 5: return "EBP";
+            case 6: return "ESI";
+            case 7: return "EDI";
+            default: return "UNKNOWN";
+            }
+        };
+        {
+            char line[220];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] dispatch selected callsite=0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
+                gDispatchCallsite, gDispatchSib, index_reg_name(gDispatchIndexReg),
+                gDispatchTableDisp, gDispatchScore);
+            log_line(line);
         }
-    };
-    {
-        char line[220];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] dispatch selected callsite=0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
-            gDispatchCallsite, gDispatchSib, index_reg_name(gDispatchIndexReg),
-            gDispatchTableDisp, gDispatchScore);
-        log_line(line);
-    }
 
-    gDispatchStub = BuildDispatchStub(gDispatchSib, gDispatchTableDisp, gDispatchRet, gDispatchIndexReg);
-    if (!gDispatchStub) {
-        log_line("[ClientFix][HitGate] dispatch stub alloc failed");
-        return;
-    }
+        gDispatchStub = BuildDispatchStub(gDispatchSib, gDispatchTableDisp, gDispatchRet, gDispatchIndexReg);
+        if (!gDispatchStub) {
+            log_line("[ClientFix][HitGate] dispatch stub alloc failed");
+            return;
+        }
 
-    DWORD oldProt = 0;
-    if (!VirtualProtect(gDispatchCallsite, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] dispatch callsite protect failed err=%lu",
-            static_cast<unsigned long>(GetLastError()));
-        log_line(line);
-        return;
-    }
+        DWORD oldProt = 0;
+        if (!VirtualProtect(gDispatchCallsite, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] dispatch callsite protect failed err=%lu",
+                static_cast<unsigned long>(GetLastError()));
+            log_line(line);
+            return;
+        }
 
-    uint8_t before[8] = {};
-    std::memcpy(before, gDispatchCallsite, sizeof(before));
+        uint8_t before[8] = {};
+        std::memcpy(before, gDispatchCallsite, sizeof(before));
 
-    int32_t rel = gDispatchStub - (gDispatchCallsite + 5);
-    gDispatchCallsite[0] = 0xE8;
-    std::memcpy(gDispatchCallsite + 1, &rel, sizeof(rel));
-    gDispatchCallsite[5] = 0x90;
-    gDispatchCallsite[6] = 0x90;
+        int32_t rel = gDispatchStub - (gDispatchCallsite + 5);
+        gDispatchCallsite[0] = 0xE8;
+        std::memcpy(gDispatchCallsite + 1, &rel, sizeof(rel));
+        gDispatchCallsite[5] = 0x90;
+        gDispatchCallsite[6] = 0x90;
 
-    DWORD ignore = 0;
-    VirtualProtect(gDispatchCallsite, 7, oldProt, &ignore);
-    FlushInstructionCache(GetCurrentProcess(), gDispatchCallsite, 7);
+        DWORD ignore = 0;
+        VirtualProtect(gDispatchCallsite, 7, oldProt, &ignore);
+        FlushInstructionCache(GetCurrentProcess(), gDispatchCallsite, 7);
 
-    uint8_t after[8] = {};
-    std::memcpy(after, gDispatchCallsite, sizeof(after));
-    char beforeText[64] = {};
-    char afterText[64] = {};
-    BytesToString(before, sizeof(before), beforeText, sizeof(beforeText));
-    BytesToString(after, sizeof(after), afterText, sizeof(afterText));
-    {
-        char line[220];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] dispatch callsite bytes BEFORE=%s AFTER=%s",
-            beforeText, afterText);
-        log_line(line);
-    }
-    bool patchOk = true;
-    if (std::memcmp(before, after, sizeof(before)) == 0) {
-        log_line("[ClientFix][HitGate] dispatch callsite bytes unchanged after patch");
-        patchOk = false;
-    }
-    if (after[0] != 0xE8) {
-        log_line("[ClientFix][HitGate] PATCH FAILED: callsite does not start with E8");
-        patchOk = false;
-    }
-    if (!patchOk) {
-        gHitGateOn.store(0);
-        return;
-    }
+        uint8_t after[8] = {};
+        std::memcpy(after, gDispatchCallsite, sizeof(after));
+        char beforeText[64] = {};
+        char afterText[64] = {};
+        BytesToString(before, sizeof(before), beforeText, sizeof(beforeText));
+        BytesToString(after, sizeof(after), afterText, sizeof(afterText));
+        {
+            char line[220];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] dispatch callsite bytes BEFORE=%s AFTER=%s",
+                beforeText, afterText);
+            log_line(line);
+        }
+        bool patchOk = true;
+        if (std::memcmp(before, after, sizeof(before)) == 0) {
+            log_line("[ClientFix][HitGate] dispatch callsite bytes unchanged after patch");
+            patchOk = false;
+        }
+        if (after[0] != 0xE8) {
+            log_line("[ClientFix][HitGate] PATCH FAILED: callsite does not start with E8");
+            patchOk = false;
+        }
+        if (!patchOk) {
+            gHitGateOn.store(0);
+            return;
+        }
 
-    {
-        char exeName[MAX_PATH] = {};
-        GetExeBasename(exeName, sizeof(exeName));
-        char line[256];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] PID=%lu EXE=%s base=0x%p callsite=0x%p table=0x%08X AFTER=%s",
-            static_cast<unsigned long>(GetCurrentProcessId()),
-            exeName[0] ? exeName : "(unknown)",
-            GetModuleHandleA(nullptr),
-            gDispatchCallsite,
-            gDispatchTableDisp,
-            afterText);
-        log_line(line);
+        {
+            char exeName[MAX_PATH] = {};
+            GetExeBasename(exeName, sizeof(exeName));
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                "[ClientFix][HitGate] PID=%lu EXE=%s base=0x%p callsite=0x%p table=0x%08X AFTER=%s",
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                exeName[0] ? exeName : "(unknown)",
+                GetModuleHandleA(nullptr),
+                gDispatchCallsite,
+                gDispatchTableDisp,
+                afterText);
+            log_line(line);
+        }
     }
 
     {
