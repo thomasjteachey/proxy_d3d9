@@ -6,9 +6,12 @@
 #include "MinHook.h"
 #include "hooks.h"   // InstallEndSceneHook, InstallCombatHooks
 #include "svk_scan.h"
+#include "net_trace.h"
+#include "wsock_hook.h"
 
 static std::once_flag gOnce;
 static std::atomic<bool> gEndSceneHooked{ false };
+static std::atomic<bool> gCombatHooksInstalled{ false };
 
 // ---- CreateDevice hooks ----
 using CreateDevice_t = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
@@ -23,6 +26,9 @@ static HRESULT STDMETHODCALLTYPE hkCreateDevice(IDirect3D9* self, UINT a, D3DDEV
     if (SUCCEEDED(hr) && out && *out && !gEndSceneHooked.exchange(true)) {
         InstallEndSceneHook(*out);   // hook EndScene on the first real device
         OutputDebugStringA("[ClientFix] EndScene hook installed (CreateDevice)\n");
+
+        // Combat hooks (HitGate) are installed lazily from EndScene after the client is rendering.
+        // Installing them from CreateDevice has been observed to hang some clients.
     }
     return hr;
 }
@@ -35,6 +41,9 @@ static HRESULT STDMETHODCALLTYPE hkCreateDeviceEx(IDirect3D9Ex* self, UINT a, D3
     if (SUCCEEDED(hr) && out && *out && !gEndSceneHooked.exchange(true)) {
         InstallEndSceneHook(reinterpret_cast<IDirect3DDevice9*>(*out));
         OutputDebugStringA("[ClientFix] EndScene hook installed (CreateDeviceEx)\n");
+
+        // Combat hooks (HitGate) are installed lazily from EndScene after the client is rendering.
+        // Installing them from CreateDevice has been observed to hang some clients during startup.
     }
     return hr;
 }
@@ -43,8 +52,8 @@ void InitHooksOnce()
 {
     std::call_once(gOnce, [] {
         MH_Initialize();
-        // Pattern-scan & attach combat hooks (safe if patterns not set—they’ll just no-op).
-        InstallCombatHooks();
+        NetTrace::Init();
+        WSockHook::Install();
         OutputDebugStringA("[ClientFix] InitHooksOnce()\n");
     });
 }

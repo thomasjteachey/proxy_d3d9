@@ -1,4 +1,5 @@
 #include "hitgate.h"
+#include "net_trace.h"
 
 #include <windows.h>
 #include <vector>
@@ -12,6 +13,10 @@
 #include "aob_scan.h"
 #include "task_queue.h"
 #include "frame_fence.h"
+
+// Forward decls (used before definition)
+static void LogInfo(const char* fmt, ...);
+
 
 static void log_line(const char* s) { OutputDebugStringA(s); OutputDebugStringA("\n"); }
 static void BytesToString(const uint8_t* bytes, size_t count, char* out, size_t outSize)
@@ -46,6 +51,11 @@ static std::atomic<uint32_t> gSaw14A{ 0 };
 static std::atomic<uint32_t> gSaw14ATid{ 0 };
 static std::array<std::atomic<uint32_t>, 0x300> gOpcodeHitCounts{};
 
+
+// fallback: if we can't find the classic opcode-dispatch callsite, we can still
+// observe + optionally gate opcode dispatch by placing INT3 breakpoints on the
+// indirect CALL-reg sites that drive packet dispatch in this client build.
+static void InstallDispatchBreakpoints();
 static uint8_t* gDispatchCallsite = nullptr;
 static uint32_t gDispatchTableDisp = 0;
 static uint8_t* gDispatchRet = nullptr;
@@ -53,10 +63,13 @@ static uint8_t gDispatchSib = 0;
 static uint8_t gDispatchIndexReg = 0;
 static uint8_t* gDispatchStub = nullptr;
 static int gDispatchScore = 0;
+static uint8_t gDispatchMode = 0; // 0=direct call [table+idx*4], 1=mov reg,[table+idx*4] then call reg
+static uint8_t gDispatchDestReg = 0; // only used for mode=1
 
 static uintptr_t gOpcodeTable = 0;
 static int gOpcodeTableScore = 0;
 
+static size_t gTextSize = 0;
 struct JmpDetour {
     uint8_t* target = nullptr;
     uint8_t* detour = nullptr;
@@ -129,8 +142,15 @@ void HitGate_ArmOneFrame()
 
 static void __cdecl OnOpcode14AHit()
 {
-    gSaw14A.fetch_add(1, std::memory_order_relaxed);
-    gSaw14ATid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // This is called from the detoured opcode-table handler for 0x14A.
+    uint32_t c = gSaw14A.fetch_add(1, std::memory_order_relaxed) + 1;
+    gNetTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+
+    if (c <= 25)
+        LogInfo("[HitGate] opcode 0x14A hit #%u (frame=%u)", c, NetTrace::GetFrame());
+
+    // Allow exactly one proc-visual push through on the next frame.
+    HitGate_ArmOneFrame();
 }
 
 static void __cdecl OnOpcodeProbeHit(uint32_t opcode)
@@ -281,49 +301,121 @@ static void __cdecl OnDispatchEnter(uint32_t opcode)
     }
 }
 
+static void __cdecl HitGate_DispatchHook(uint32_t opcode)
+{
+    OnDispatchEnter(opcode);
+}
+
+
 static uint8_t* BuildDispatchStub(uint8_t sib, uint32_t tableDisp, uint8_t* retaddr, uint8_t indexRegId)
 {
-    std::vector<uint8_t> code;
-    auto emit = [&code](uint8_t b) { code.push_back(b); };
-    auto emit32 = [&code](uint32_t v) {
-        code.push_back(static_cast<uint8_t>(v));
-        code.push_back(static_cast<uint8_t>(v >> 8));
-        code.push_back(static_cast<uint8_t>(v >> 16));
-        code.push_back(static_cast<uint8_t>(v >> 24));
-    };
+    // The original instruction we patch is 7 bytes:  FF 14 <sib> <disp32>
+    // When we replace it with a 5-byte CALL rel32, the return address pushed will be (site+5),
+    // but the *real* post-instruction address is (site+7). Fix by rewriting the return address
+    // on the stack to retaddr, then use RET at the end of the stub.
 
-    emit(0x9C); // pushfd
-    emit(0x60); // pushad
-    emit(static_cast<uint8_t>(0x50 + indexRegId)); // push <index-reg>
-    emit(0xE8); // call rel32
-    size_t callRelPos = code.size();
-    emit32(0);
-    emit(0x83); emit(0xC4); emit(0x04); // add esp, 4
-    emit(0x61); // popad
-    emit(0x9D); // popfd
-    emit(0xFF); emit(0x14); emit(sib); // call [reg*4 + disp32]
-    size_t dispPos = code.size();
-    emit32(tableDisp);
-    emit(0xE9); // jmp rel32
-    size_t jmpRelPos = code.size();
-    emit32(0);
+    uint8_t* stub = (uint8_t*)VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub)
+        return nullptr;
 
-    uint8_t* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, code.size(),
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!stub) return nullptr;
+    uint8_t* w = stub;
 
-    std::memcpy(stub, code.data(), code.size());
+    // mov dword ptr [esp], imm32   ; rewrite return address
+    *w++ = 0xC7; *w++ = 0x04; *w++ = 0x24;
+    *(uint32_t*)w = (uint32_t)(uintptr_t)retaddr; w += 4;
 
-    int32_t callRel = reinterpret_cast<uint8_t*>(&OnDispatchEnter) -
-        (stub + callRelPos + sizeof(int32_t));
-    std::memcpy(stub + callRelPos, &callRel, sizeof(callRel));
+    // pushfd / pushad
+    *w++ = 0x9C;
+    *w++ = 0x60;
 
-    int32_t jmpRel = retaddr - (stub + jmpRelPos + sizeof(int32_t));
-    std::memcpy(stub + jmpRelPos, &jmpRel, sizeof(jmpRel));
+    // push <indexReg>
+    *w++ = (uint8_t)(0x50 + (indexRegId & 7));
 
-    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    // call HitGate_DispatchHook(uint32 opcodeIndex)
+    *w++ = 0xE8;
+    {
+        int32_t rel = (int32_t)((uint8_t*)&HitGate_DispatchHook - (w + 4));
+        *(int32_t*)w = rel;
+        w += 4;
+    }
+
+    // add esp, 4
+    *w++ = 0x83; *w++ = 0xC4; *w++ = 0x04;
+
+    // popad / popfd
+    *w++ = 0x61;
+    *w++ = 0x9D;
+
+    // call dword ptr [disp32 + indexReg*4]  (original semantics)
+    *w++ = 0xFF; *w++ = 0x14; *w++ = sib;
+    *(uint32_t*)w = tableDisp; w += 4;
+
+    // ret  (to retaddr we wrote above)
+    *w++ = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), stub, (SIZE_T)(w - stub));
     return stub;
 }
+
+static uint8_t* BuildDispatchMovStub(uint8_t destRegId, uint8_t indexRegId, uint32_t tableDisp, uint8_t* retaddr)
+{
+    // Handles a dispatch pattern of:
+    //   mov rDest, dword ptr [disp32 + rIndex*4]
+    //   ... (possibly a couple bytes) ...
+    //   call rDest
+    // We patch the MOV (7 bytes), do the gate/log, re-run the MOV, then RET back to retaddr (after MOV).
+
+    uint8_t* stub = (uint8_t*)VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub)
+        return nullptr;
+
+    uint8_t* w = stub;
+
+    // mov dword ptr [esp], imm32   ; rewrite return address to the real post-MOV address (site+7)
+    *w++ = 0xC7; *w++ = 0x04; *w++ = 0x24;
+    *(uint32_t*)w = (uint32_t)(uintptr_t)retaddr; w += 4;
+
+    // pushfd / pushad
+    *w++ = 0x9C;
+    *w++ = 0x60;
+
+    // push <indexReg>
+    *w++ = (uint8_t)(0x50 + (indexRegId & 7));
+
+    // call HitGate_DispatchHook(uint32 opcodeIndex)
+    *w++ = 0xE8;
+    {
+        int32_t rel = (int32_t)((uint8_t*)&HitGate_DispatchHook - (w + 4));
+        *(int32_t*)w = rel;
+        w += 4;
+    }
+
+    // add esp, 4
+    *w++ = 0x83; *w++ = 0xC4; *w++ = 0x04;
+
+    // popad / popfd
+    *w++ = 0x61;
+    *w++ = 0x9D;
+
+    // Re-run the original MOV: 8B /r with SIB [disp32 + indexReg*4]
+    //   8B <modrm> <sib> <disp32>
+    // modrm: mod=00 r/m=100 (SIB), reg=destReg
+    uint8_t modrm = (uint8_t)(0x04 | ((destRegId & 7) << 3));
+    // sib: scale=4 (2), index=indexReg, base=disp32 (5)
+    uint8_t sib = (uint8_t)(0x80 | ((indexRegId & 7) << 3) | 0x05);
+
+    *w++ = 0x8B;
+    *w++ = modrm;
+    *w++ = sib;
+    *(uint32_t*)w = tableDisp; w += 4;
+
+    // ret  (to retaddr we wrote above)
+    *w++ = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), stub, (SIZE_T)(w - stub));
+    return stub;
+}
+
 
 static bool ReadPtr(uintptr_t addr, uintptr_t& out)
 {
@@ -338,8 +430,6 @@ static bool ReadPtr(uintptr_t addr, uintptr_t& out)
 
 static uintptr_t NormalizePtr(uintptr_t ptr, uintptr_t imageStart, size_t imageSize)
 {
-    uintptr_t imageEnd = imageStart + imageSize;
-    if (ptr >= imageStart && ptr < imageEnd) return ptr;
     if (ptr > 0x1000 && ptr < imageSize) return imageStart + ptr;
     return ptr;
 }
@@ -365,6 +455,17 @@ static bool PtrInRange(uintptr_t ptr, uintptr_t start, uintptr_t end)
 {
     return ptr >= start && ptr < end;
 }
+
+static void LogInfo(const char* fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_line(buf);
+}
+
 
 enum class TableEncoding {
     Unknown,
@@ -794,92 +895,233 @@ static bool PatchOpcodeTableProbes(uintptr_t tableAddr)
     return true;
 }
 
-static bool FindDispatchCallsite()
+
+// 3-arg image range helper used by dispatch-scan code.
+// This is intentionally self-contained to avoid relying on other compilation units.
+static bool GetImageRange(uint8_t*& start, uint8_t*& end, size_t& size)
 {
-    uint8_t* textBase = nullptr; size_t textSize = 0;
-    uint8_t* imageBase = nullptr; size_t imageSize = 0;
-    if (!GetTextRange(textBase, textSize) || !GetImageRange(imageBase, imageSize)) return false;
+    HMODULE hMod = GetModuleHandleA(nullptr);
+    if (!hMod)
+        return false;
 
-    uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageBase);
-    uintptr_t imageEnd = imageStart + imageSize;
-    uintptr_t textStart = reinterpret_cast<uintptr_t>(textBase);
-    uintptr_t textEnd = textStart + textSize;
-    auto normalize_ptr = [&](uintptr_t ptr) -> uintptr_t {
-        return NormalizePtr(ptr, imageStart, imageSize);
-    };
-    auto ptr_in_text = [&](uintptr_t ptr) -> bool {
-        return ptr >= textStart && ptr < textEnd;
-    };
+    auto* base = reinterpret_cast<uint8_t*>(hMod);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
 
-    int bestScore = -1;
-    uint8_t* bestSite = nullptr;
-    uint32_t bestTable = 0;
-    uint8_t bestSib = 0;
-    uint8_t bestIndexReg = 0;
-    int candidates = 0;
-
-    for (size_t i = 0; i + 7 <= textSize; ++i) {
-        const uint8_t* p = textBase + i;
-        if (p[0] != 0xFF) continue;
-        if (p[1] != 0x14) continue;
-        uint8_t sib = p[2];
-        bool scale4 = (sib & 0xC0) == 0x80;
-        bool baseNone = (sib & 0x07) == 0x05;
-        uint8_t idx = (sib >> 3) & 0x07;
-        bool idxOk = (idx != 4);
-        if (!(scale4 && baseNone && idxOk)) continue;
-
-        ++candidates;
-        uint32_t tableAddr = *reinterpret_cast<const uint32_t*>(p + 3);
-        if (tableAddr < imageStart || tableAddr + sizeof(uintptr_t) >= imageEnd) continue;
-
-        uintptr_t tableStart = static_cast<uintptr_t>(tableAddr);
-        uintptr_t tableEnd = tableStart + ((512 + 1) * sizeof(uintptr_t));
-        if (tableEnd > imageEnd) continue;
-
-        uintptr_t entryAddr = tableStart + (0x14A * sizeof(uintptr_t));
-        uintptr_t fn = 0;
-        if (!ReadPtr(entryAddr, fn)) continue;
-        fn = normalize_ptr(fn);
-        if (!ptr_in_text(fn)) continue;
-
-        int score = 0;
-        for (size_t idx = 0; idx <= 512; ++idx) {
-            uintptr_t entry = 0;
-            if (!ReadPtr(tableStart + (idx * sizeof(uintptr_t)), entry)) continue;
-            entry = normalize_ptr(entry);
-            if (ptr_in_text(entry)) ++score;
-        }
-
-        if (score < 100) continue;
-
-        if (score > bestScore) {
-            bestScore = score;
-            bestSite = const_cast<uint8_t*>(p);
-            bestTable = tableAddr;
-            bestSib = sib;
-            bestIndexReg = idx;
-        }
-    }
-
-    {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] dispatch candidates=%d",
-            candidates);
-        log_line(line);
-    }
-
-    if (!bestSite) return false;
-
-    gDispatchCallsite = bestSite;
-    gDispatchTableDisp = bestTable;
-    gDispatchRet = gDispatchCallsite + 7;
-    gDispatchSib = bestSib;
-    gDispatchIndexReg = bestIndexReg;
-    gDispatchScore = bestScore;
+    size = static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
+    start = base;
+    end = base + size;
     return true;
 }
+
+
+static bool GetCurrentImageRange(uintptr_t& imageStart, uintptr_t& imageEnd)
+{
+    uint8_t* s = nullptr;
+    uint8_t* e = nullptr;
+    size_t sz = 0;
+    if (!GetImageRange(s, e, sz))
+        return false;
+    imageStart = (uintptr_t)s;
+    imageEnd = (uintptr_t)e;
+    return true;
+}
+
+static uintptr_t ReadTableU32(uintptr_t tableAddr, uint32_t index)
+{
+    uint32_t v = 0;
+    __try
+    {
+        v = *reinterpret_cast<uint32_t*>(tableAddr + (uintptr_t)index * sizeof(uint32_t));
+        return (uintptr_t)v;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+// overload used by callsites that expect to learn whether the entry was RVA-encoded.
+// NOTE: take pointers for the image bounds so callers don't need to cast.
+static uintptr_t ResolveTableEntryVA(uintptr_t raw, const uint8_t* imageStartPtr, const uint8_t* imageEndPtr, size_t imageSize, bool& entryIsRva)
+{
+    const uintptr_t imageStart = reinterpret_cast<uintptr_t>(imageStartPtr);
+    const uintptr_t imageEnd   = reinterpret_cast<uintptr_t>(imageEndPtr);
+
+    if (raw >= imageStart && raw < imageEnd)
+    {
+        entryIsRva = false;
+        return raw;
+    }
+
+    uintptr_t va = imageStart + raw;
+    if (raw < imageSize && va >= imageStart && va < imageEnd)
+    {
+        entryIsRva = true;
+        return va;
+    }
+
+    entryIsRva = false;
+    return 0;
+}
+
+static bool FindDispatchCallsite(uintptr_t tableAddr, uint8_t* imageStart, uint8_t* imageEnd);
+
+static bool FindDispatchCallsite()
+{
+    uint8_t* textBase = nullptr;
+    size_t   textSize = 0;
+    if (!GetTextRange(textBase, textSize))
+        return false;
+static bool FindDispatchCallsite(uintptr_t tableAddr, uint8_t* imageStart, uint8_t* imageEnd)
+{
+    // We want to hook the main opcode dispatch so we can observe/gate combat opcodes.
+    // Some builds use a direct:
+    //   call dword ptr [disp32 + idx*4]        ; FF 14 <sib> <disp32>
+    // Other builds use:
+    //   mov rDest, dword ptr [disp32 + idx*4]  ; 8B /r <sib> <disp32>
+    //   call rDest
+
+    gDispatchCallsite = nullptr;
+    gDispatchRet = nullptr;
+    gDispatchScore = 0;
+    gDispatchMode = 0;
+    gDispatchDestReg = 0;
+    gDispatchSib = 0;
+    gDispatchIndexReg = 0;
+    gDispatchTableDisp = 0;
+
+    if (!imageStart || !imageEnd || imageEnd <= imageStart)
+        return false;
+
+    uint32_t imageSize = (uint32_t)(imageEnd - imageStart);
+
+    // .text start heuristic used elsewhere in the project
+    uint8_t* textStart = imageStart + 0x1000;
+    uint8_t* textEnd = imageStart + gTextSize;
+    if (textEnd > imageEnd)
+        textEnd = imageEnd;
+
+    if (textEnd <= textStart + 16)
+        return false;
+
+    // Sanity: resolve 0x14A to ensure tableAddr looks like a real opcode table.
+    bool entryIsRva = false;
+    uintptr_t raw14A = ReadTableU32(tableAddr, 0x14A);
+    uintptr_t handler14A = ResolveTableEntryVA(raw14A, imageStart, imageEnd, imageSize, entryIsRva);
+    bool handler14AInText = (handler14A >= (uintptr_t)textStart && handler14A < (uintptr_t)textEnd);
+
+    uint8_t* bestSite = nullptr;
+    uint8_t bestSib = 0;
+    uint8_t bestIdx = 0;
+    uint8_t bestMode = 0;
+    uint8_t bestDest = 0;
+    int bestScore = 0;
+
+    for (uint8_t* p = textStart; p + 7 <= textEnd; ++p)
+    {
+        // Pattern A: call dword ptr [disp32 + idx*4]  => FF 14 <sib> <disp32>
+        if (p[0] == 0xFF && p[1] == 0x14)
+        {
+            uint8_t sib = p[2];
+            uint32_t disp32 = *(uint32_t*)(p + 3);
+
+            if (disp32 == (uint32_t)tableAddr)
+            {
+                uint8_t idxReg = (sib >> 3) & 7;
+                if (idxReg != 4) // index=ESP is invalid for SIB
+                {
+                    int score = 600;
+                    if (handler14AInText)
+                        score += 50;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestSite = p;
+                        bestSib = sib;
+                        bestIdx = idxReg;
+                        bestMode = 0;
+                        bestDest = 0;
+                    }
+                }
+            }
+        }
+
+        // Pattern B: mov rDest, dword ptr [disp32 + idx*4]  => 8B <modrm> <sib> <disp32>
+        //            then a nearby "call rDest" (FF D0+dest)
+        if (p[0] == 0x8B && ((p[1] & 0xC7) == 0x04))
+        {
+            uint8_t modrm = p[1];
+            uint8_t sib = p[2];
+            uint32_t disp32 = *(uint32_t*)(p + 3);
+
+            if (disp32 == (uint32_t)tableAddr)
+            {
+                uint8_t scale = (sib >> 6) & 3;
+                uint8_t idxReg = (sib >> 3) & 7;
+                uint8_t base = sib & 7;
+
+                if (scale == 2 && base == 5 && idxReg != 4)
+                {
+                    uint8_t destReg = (modrm >> 3) & 7;
+
+                    bool hasCall = false;
+                    uint8_t callModrm = (uint8_t)(0xD0 + (destReg & 7)); // FF /2 with mod=11
+                    for (uint8_t* q = p + 7; q + 2 <= textEnd && q < p + 7 + 32; ++q)
+                    {
+                        if (q[0] == 0xFF && q[1] == callModrm)
+                        {
+                            hasCall = true;
+                            break;
+                        }
+                    }
+
+                    int score = hasCall ? 750 : 500;
+                    if (handler14AInText)
+                        score += 25;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestSite = p;
+                        bestSib = sib;
+                        bestIdx = idxReg;
+                        bestMode = 1;
+                        bestDest = destReg;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!bestSite)
+        return false;
+
+    gDispatchScore = bestScore;
+    gDispatchCallsite = bestSite;
+    gDispatchRet = bestSite + 7;
+    gDispatchSib = bestSib;
+    gDispatchIndexReg = bestIdx;
+    gDispatchMode = bestMode;
+    gDispatchDestReg = bestDest;
+    gDispatchTableDisp = (uint32_t)tableAddr;
+
+    LogInfo("[ClientFix][HitGate] dispatch callsite=0x%08X mode=%u idxReg=%u destReg=%u disp=0x%08X score=%d",
+        (uint32_t)(uintptr_t)gDispatchCallsite,
+        (unsigned)gDispatchMode,
+        (unsigned)gDispatchIndexReg,
+        (unsigned)gDispatchDestReg,
+        (unsigned)gDispatchTableDisp,
+        gDispatchScore);
+
+    return true;
+}
+
 
 static const char* GetExeBasename(char* out, size_t outSize)
 {
@@ -949,106 +1191,110 @@ void HitGate_Init()
 
     if (!FindDispatchCallsite()) {
         log_line("[ClientFix][HitGate] dispatch callsite not found");
-    } else {
-        auto index_reg_name = [](uint8_t regId) {
-            switch (regId) {
-            case 0: return "EAX";
-            case 1: return "ECX";
-            case 2: return "EDX";
-            case 3: return "EBX";
-            case 5: return "EBP";
-            case 6: return "ESI";
-            case 7: return "EDI";
-            default: return "UNKNOWN";
-            }
-        };
-        {
-            char line[220];
-            std::snprintf(line, sizeof(line),
-                "[ClientFix][HitGate] dispatch selected callsite=0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
-                gDispatchCallsite, gDispatchSib, index_reg_name(gDispatchIndexReg),
-                gDispatchTableDisp, gDispatchScore);
-            log_line(line);
-        }
+        InstallDispatchBreakpoints();
+        return;
+    }
 
-        gDispatchStub = BuildDispatchStub(gDispatchSib, gDispatchTableDisp, gDispatchRet, gDispatchIndexReg);
-        if (!gDispatchStub) {
-            log_line("[ClientFix][HitGate] dispatch stub alloc failed");
-            return;
+    auto index_reg_name = [](uint8_t regId) {
+        switch (regId) {
+        case 0: return "EAX";
+        case 1: return "ECX";
+        case 2: return "EDX";
+        case 3: return "EBX";
+        case 5: return "EBP";
+        case 6: return "ESI";
+        case 7: return "EDI";
+        default: return "UNKNOWN";
         }
+    };
+    {
+        char line[220];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] dispatch selected callsite=0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
+            gDispatchCallsite, (unsigned)gDispatchMode, gDispatchSib, index_reg_name(gDispatchIndexReg),
+            (unsigned)gDispatchDestReg, gDispatchTableDisp, gDispatchScore);
+        log_line(line);
+    }
 
-        DWORD oldProt = 0;
-        if (!VirtualProtect(gDispatchCallsite, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                "[ClientFix][HitGate] dispatch callsite protect failed err=%lu",
-                static_cast<unsigned long>(GetLastError()));
-            log_line(line);
-            return;
-        }
+    gDispatchStub = (gDispatchMode == 0)
+        ? BuildDispatchStub(gDispatchSib, gDispatchTableDisp, gDispatchRet, gDispatchIndexReg)
+        : BuildDispatchMovStub(gDispatchDestReg, gDispatchIndexReg, gDispatchTableDisp, gDispatchRet);
+    if (!gDispatchStub) {
+        log_line("[ClientFix][HitGate] dispatch stub alloc failed");
+        return;
+    }
 
-        uint8_t before[8] = {};
-        std::memcpy(before, gDispatchCallsite, sizeof(before));
+    DWORD oldProt = 0;
+    if (!VirtualProtect(gDispatchCallsite, 7, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] dispatch callsite protect failed err=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        log_line(line);
+        return;
+    }
 
-        int32_t rel = gDispatchStub - (gDispatchCallsite + 5);
-        gDispatchCallsite[0] = 0xE8;
-        std::memcpy(gDispatchCallsite + 1, &rel, sizeof(rel));
-        gDispatchCallsite[5] = 0x90;
-        gDispatchCallsite[6] = 0x90;
+    uint8_t before[8] = {};
+    std::memcpy(before, gDispatchCallsite, sizeof(before));
 
-        DWORD ignore = 0;
-        VirtualProtect(gDispatchCallsite, 7, oldProt, &ignore);
-        FlushInstructionCache(GetCurrentProcess(), gDispatchCallsite, 7);
+    int32_t rel = gDispatchStub - (gDispatchCallsite + 5);
+    gDispatchCallsite[0] = 0xE8;
+    std::memcpy(gDispatchCallsite + 1, &rel, sizeof(rel));
+    gDispatchCallsite[5] = 0x90;
+    gDispatchCallsite[6] = 0x90;
 
-        uint8_t after[8] = {};
-        std::memcpy(after, gDispatchCallsite, sizeof(after));
-        char beforeText[64] = {};
-        char afterText[64] = {};
-        BytesToString(before, sizeof(before), beforeText, sizeof(beforeText));
-        BytesToString(after, sizeof(after), afterText, sizeof(afterText));
-        {
-            char line[220];
-            std::snprintf(line, sizeof(line),
-                "[ClientFix][HitGate] dispatch callsite bytes BEFORE=%s AFTER=%s",
-                beforeText, afterText);
-            log_line(line);
-        }
-        bool patchOk = true;
-        if (std::memcmp(before, after, sizeof(before)) == 0) {
-            log_line("[ClientFix][HitGate] dispatch callsite bytes unchanged after patch");
-            patchOk = false;
-        }
-        if (after[0] != 0xE8) {
-            log_line("[ClientFix][HitGate] PATCH FAILED: callsite does not start with E8");
-            patchOk = false;
-        }
-        if (!patchOk) {
-            gHitGateOn.store(0);
-            return;
-        }
+    DWORD ignore = 0;
+    VirtualProtect(gDispatchCallsite, 7, oldProt, &ignore);
+    FlushInstructionCache(GetCurrentProcess(), gDispatchCallsite, 7);
 
-        {
-            char exeName[MAX_PATH] = {};
-            GetExeBasename(exeName, sizeof(exeName));
-            char line[256];
-            std::snprintf(line, sizeof(line),
-                "[ClientFix][HitGate] PID=%lu EXE=%s base=0x%p callsite=0x%p table=0x%08X AFTER=%s",
-                static_cast<unsigned long>(GetCurrentProcessId()),
-                exeName[0] ? exeName : "(unknown)",
-                GetModuleHandleA(nullptr),
-                gDispatchCallsite,
-                gDispatchTableDisp,
-                afterText);
-            log_line(line);
-        }
+    uint8_t after[8] = {};
+    std::memcpy(after, gDispatchCallsite, sizeof(after));
+    char beforeText[64] = {};
+    char afterText[64] = {};
+    BytesToString(before, sizeof(before), beforeText, sizeof(beforeText));
+    BytesToString(after, sizeof(after), afterText, sizeof(afterText));
+    {
+        char line[220];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] dispatch callsite bytes BEFORE=%s AFTER=%s",
+            beforeText, afterText);
+        log_line(line);
+    }
+    bool patchOk = true;
+    if (std::memcmp(before, after, sizeof(before)) == 0) {
+        log_line("[ClientFix][HitGate] dispatch callsite bytes unchanged after patch");
+        patchOk = false;
+    }
+    if (after[0] != 0xE8) {
+        log_line("[ClientFix][HitGate] PATCH FAILED: callsite does not start with E8");
+        patchOk = false;
+    }
+    if (!patchOk) {
+        gHitGateOn.store(0);
+        return;
+    }
+
+    {
+        char exeName[MAX_PATH] = {};
+        GetExeBasename(exeName, sizeof(exeName));
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "[ClientFix][HitGate] PID=%lu EXE=%s base=0x%p callsite=0x%p table=0x%08X AFTER=%s",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            exeName[0] ? exeName : "(unknown)",
+            GetModuleHandleA(nullptr),
+            gDispatchCallsite,
+            gDispatchTableDisp,
+            afterText);
+        log_line(line);
     }
 
     {
         char line[200];
         std::snprintf(line, sizeof(line),
-            "[ClientFix][HitGate] Dispatch callsite hook installed @ 0x%p sib=0x%02X idxReg=%s table=0x%08X score=%d",
-            gDispatchCallsite, gDispatchSib, index_reg_name(gDispatchIndexReg),
-            gDispatchTableDisp, gDispatchScore);
+            "[ClientFix][HitGate] Dispatch callsite hook installed @ 0x%p mode=%u sib=0x%02X idxReg=%s destReg=%u table=0x%08X score=%d",
+            gDispatchCallsite, (unsigned)gDispatchMode, gDispatchSib, index_reg_name(gDispatchIndexReg),
+            (unsigned)gDispatchDestReg, gDispatchTableDisp, gDispatchScore);
         log_line(line);
     }
 
