@@ -144,7 +144,7 @@ static void __cdecl OnOpcode14AHit()
 {
     // This is called from the detoured opcode-table handler for 0x14A.
     uint32_t c = gSaw14A.fetch_add(1, std::memory_order_relaxed) + 1;
-    gNetTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    gSaw14ATid.store(GetCurrentThreadId(), std::memory_order_relaxed);
 
     if (c <= 25)
         LogInfo("[HitGate] opcode 0x14A hit #%u (frame=%u)", c, NetTrace::GetFrame());
@@ -304,6 +304,11 @@ static void __cdecl OnDispatchEnter(uint32_t opcode)
 static void __cdecl HitGate_DispatchHook(uint32_t opcode)
 {
     OnDispatchEnter(opcode);
+}
+
+static void InstallDispatchBreakpoints()
+{
+    log_line("[ClientFix][HitGate] dispatch breakpoints not available in this build");
 }
 
 
@@ -977,6 +982,27 @@ static bool FindDispatchCallsite()
     size_t   textSize = 0;
     if (!GetTextRange(textBase, textSize))
         return false;
+    gTextSize = textSize;
+
+    uintptr_t imageStart = 0;
+    uintptr_t imageEnd = 0;
+    if (!GetCurrentImageRange(imageStart, imageEnd))
+        return false;
+
+    uintptr_t tableAddr = gOpcodeTable;
+    if (tableAddr == 0) {
+        int score = 0;
+        if (!FindOpcodeTable(tableAddr, score))
+            return false;
+        gOpcodeTable = tableAddr;
+        gOpcodeTableScore = score;
+    }
+
+    return FindDispatchCallsite(tableAddr,
+        reinterpret_cast<uint8_t*>(imageStart),
+        reinterpret_cast<uint8_t*>(imageEnd));
+}
+
 static bool FindDispatchCallsite(uintptr_t tableAddr, uint8_t* imageStart, uint8_t* imageEnd)
 {
     // We want to hook the main opcode dispatch so we can observe/gate combat opcodes.
