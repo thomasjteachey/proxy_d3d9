@@ -306,6 +306,11 @@ static void __cdecl HitGate_DispatchHook(uint32_t opcode)
     OnDispatchEnter(opcode);
 }
 
+static void InstallDispatchBreakpoints()
+{
+    log_line("[ClientFix][HitGate] dispatch breakpoints not available in this build");
+}
+
 
 static uint8_t* BuildDispatchStub(uint8_t sib, uint32_t tableDisp, uint8_t* retaddr, uint8_t indexRegId)
 {
