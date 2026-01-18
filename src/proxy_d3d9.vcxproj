@@ -188,6 +188,7 @@
     <ClInclude Include="svk_scan.h" />
     <ClInclude Include="task_queue.h" />
     <ClInclude Include="timing.h" />
+    <ClInclude Include="wsock_hook.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\3rdparty\minhook\src\buffer.c" />
@@ -206,6 +207,7 @@
     <ClCompile Include="svk_scan.cpp" />
     <ClCompile Include="task_queue.cpp" />
     <ClCompile Include="timing.cpp" />
+    <ClCompile Include="wsock_hook.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="d3d9_exports.def" />
